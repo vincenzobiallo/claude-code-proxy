@@ -23,6 +23,50 @@ fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
 }
 
+struct EnvGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+/// Spawns a local stand-in for `api.anthropic.com` that answers every request
+/// with a minimal 200 so passthrough-routed tests never make a real network call.
+async fn spawn_anthropic_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(|| async {
+        axum::http::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"input_tokens":1}"#))
+            .unwrap()
+    });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://{addr}")
+}
+
 struct FakeCli;
 
 impl CliHandlers for FakeCli {
@@ -784,6 +828,9 @@ async fn context_window_hint_is_removed_before_provider_dispatch() {
 
 #[tokio::test]
 async fn opus_5_alias_routes_to_provider() {
+    let upstream = spawn_anthropic_upstream().await;
+    let _base_url_env = EnvGuard::set("CCP_ANTHROPIC_BASE_URL", &upstream);
+
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(

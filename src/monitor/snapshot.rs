@@ -1,8 +1,8 @@
 //! Immutable dashboard read models. Process-local clocks and mutable accounting
 //! stay in the monitor store; viewers receive elapsed durations and computed rates.
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionSummary,
-    Throughput,
+    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, QuotaStatus, RequestStatus,
+    SessionSummary, Throughput,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -76,6 +76,8 @@ pub struct MonitorSnapshot {
     pub sessions: Vec<SessionSnapshot>,
     pub active: Vec<ActiveSnapshot>,
     pub recent: Vec<CompletedSnapshot>,
+    #[serde(default)]
+    pub quota: Vec<QuotaStatus>,
 }
 
 impl From<MonitorState> for MonitorSnapshot {
@@ -87,6 +89,7 @@ impl From<MonitorState> for MonitorSnapshot {
             sessions: state.sessions.into_iter().map(Into::into).collect(),
             active: state.active.into_iter().map(Into::into).collect(),
             recent: state.recent.into_iter().map(Into::into).collect(),
+            quota: state.quota,
         }
     }
 }

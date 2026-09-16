@@ -27,7 +27,7 @@ use crate::anthropic::schema::{CountTokensResponse, MessagesRequest};
 use crate::anthropic::sse::parse_sse_events;
 use crate::config;
 use crate::logging::create_logger;
-use crate::monitor::usage_from_anthropic_sse;
+use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::registry;
 use crate::request_identity::ConversationIdentity;
@@ -159,7 +159,7 @@ impl CodexProvider {
                             ),
                         ])),
                     );
-                    return map_codex_error_to_response(&error);
+                    return map_codex_error_to_response(&error, ctx.monitor.as_ref());
                 }
             };
             log.info(
@@ -265,7 +265,7 @@ impl CodexProvider {
                         translated.input.len(),
                         Some(&error.to_string()),
                     );
-                    return map_codex_error_to_response(&error);
+                    return map_codex_error_to_response(&error, ctx.monitor.as_ref());
                 }
                 Err(error) => {
                     abort_compaction_attempt(Some(session_id), Some(attempt));
@@ -393,7 +393,7 @@ impl CodexProvider {
                     );
                     abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                     abort_continuation_for_owner(&request_continuation);
-                    return map_codex_error_to_response(&e);
+                    return map_codex_error_to_response(&e, ctx.monitor.as_ref());
                 }
             };
             if !is_empty_codex_success_completion(&response.body) {
@@ -406,13 +406,13 @@ impl CodexProvider {
             if attempt >= MAX_EMPTY_COMPLETION_RETRIES {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
-                return map_codex_error_to_response(&error);
+                return map_codex_error_to_response(&error, ctx.monitor.as_ref());
             }
             let delay = compute_backoff_delay(attempt, None);
             if delay.exceeds_budget {
                 abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
                 abort_continuation_for_owner(&request_continuation);
-                return map_codex_error_to_response(&error);
+                return map_codex_error_to_response(&error, ctx.monitor.as_ref());
             }
             attempt += 1;
             sleep(delay.wait_ms).await;
@@ -420,7 +420,7 @@ impl CodexProvider {
         if let Some(failure) = events::first_event_failure(&upstream.body) {
             abort_compaction_attempt(ctx.session_id.as_deref(), compaction_attempt);
             abort_continuation_for_owner(&request_continuation);
-            return map_codex_event_failure_to_response(&failure);
+            return map_codex_event_failure_to_response(&failure, ctx.monitor.as_ref());
         }
         log.info(
             "codex_upstream_response_received",
@@ -761,7 +761,7 @@ async fn live_stream_response(
             Ok(events) => events,
             Err(err) if err.origin == client::CodexErrorOrigin::Http => {
                 cleanup.abort();
-                return map_codex_error_to_response(&err);
+                return map_codex_error_to_response(&err, ctx.monitor.as_ref());
             }
             Err(err) if retryable_live_start_codex_error(&err) => {
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
@@ -771,12 +771,12 @@ async fn live_stream_response(
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     cleanup.abort();
-                    return map_codex_error_to_response(&err);
+                    return map_codex_error_to_response(&err, ctx.monitor.as_ref());
                 }
                 let delay = compute_backoff_delay(attempt, err.retry_after.as_deref());
                 if delay.exceeds_budget {
                     cleanup.abort();
-                    return map_codex_error_to_response(&err);
+                    return map_codex_error_to_response(&err, ctx.monitor.as_ref());
                 }
                 attempt += 1;
                 sleep(delay.wait_ms).await;
@@ -784,7 +784,7 @@ async fn live_stream_response(
             }
             Err(err) => {
                 cleanup.abort();
-                return map_codex_error_to_response(&err);
+                return map_codex_error_to_response(&err, ctx.monitor.as_ref());
             }
         };
 
@@ -813,12 +813,12 @@ async fn live_stream_response(
                 // loop by the provider-level WebSocket retry policy.
                 if error.origin == client::CodexErrorOrigin::Http {
                     cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                    return map_codex_error_to_response(&error, ctx.monitor.as_ref());
                 }
                 let dropped = drop_live_continuation_for_retry(&mut continuation);
                 if full_context_retry_attempted && client::is_continuation_retry_error(&error) {
                     cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                    return map_codex_error_to_response(&error, ctx.monitor.as_ref());
                 }
                 if dropped && is_missing_previous_response_error(&error) {
                     attempt += 1;
@@ -826,12 +826,12 @@ async fn live_stream_response(
                 }
                 if attempt >= MAX_RETRYABLE_LIVE_STREAM_RETRIES {
                     cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                    return map_codex_error_to_response(&error, ctx.monitor.as_ref());
                 }
                 let delay = compute_backoff_delay(attempt, error.retry_after.as_deref());
                 if delay.exceeds_budget {
                     cleanup.abort();
-                    return map_codex_error_to_response(&error);
+                    return map_codex_error_to_response(&error, ctx.monitor.as_ref());
                 }
                 attempt += 1;
                 sleep(delay.wait_ms).await;
@@ -886,7 +886,7 @@ async fn live_stream_response_once(
                     &request_continuation,
                     compaction.attempt,
                 );
-                return LiveStreamStart::Response(map_codex_error_to_response(&err));
+                return LiveStreamStart::Response(map_codex_error_to_response(&err, ctx.monitor.as_ref()));
             }
         };
         if !generation_started && codex_generation_event(&payload) {
@@ -928,6 +928,7 @@ async fn live_stream_response_once(
                     );
                     return LiveStreamStart::Response(map_codex_event_failure_to_response(
                         &failure,
+                        ctx.monitor.as_ref(),
                     ));
                 }
                 abort_request_state(
@@ -1472,8 +1473,17 @@ fn usage_limit_response(limit: &events::CodexUsageLimit) -> Response {
         .into_response()
 }
 
-fn map_codex_error_to_response(err: &client::CodexError) -> Response {
+fn map_codex_error_to_response(err: &client::CodexError, monitor: Option<&MonitorHandle>) -> Response {
     if let Some(limit) = err.usage_limit.as_ref() {
+        if let Some(monitor) = monitor {
+            monitor.provider_quota_status(
+                "codex",
+                true,
+                limit.resets_at,
+                limit.window.map(|window| window.claim().to_string()),
+                Some(limit.message.clone()),
+            );
+        }
         return usage_limit_response(limit);
     }
     let message = codex_error_message(err);
@@ -1539,7 +1549,24 @@ fn map_codex_failure_to_response(message: &str) -> Response {
     }
 }
 
-fn map_codex_event_failure_to_response(failure: &events::CodexEventFailure) -> Response {
+fn map_codex_event_failure_to_response(
+    failure: &events::CodexEventFailure,
+    monitor: Option<&MonitorHandle>,
+) -> Response {
+    // OpenAI's cross-API billing/credits-exhausted code. Unlike `usage_limit_reached`
+    // (5h/7d session windows, handled in `map_codex_error_to_response`), a credit-pool
+    // plan (e.g. Enterprise) carries no reset clock here - only the fact that it's out.
+    if failure.code.as_deref() == Some("insufficient_quota")
+        && let Some(monitor) = monitor
+    {
+        monitor.provider_quota_status(
+            "codex",
+            true,
+            None,
+            None,
+            Some(failure.message.clone()),
+        );
+    }
     let status = StatusCode::from_u16(failure.client_status()).unwrap_or(StatusCode::BAD_GATEWAY);
     let response = json_error(status, failure.client_error_type(), &failure.message);
     if let Some(retry_after) = failure.retry_after.as_deref() {
@@ -2119,7 +2146,7 @@ mod tests {
             usage_limit: None,
             origin: client::CodexErrorOrigin::WebSocketHandshake,
         };
-        let response = map_codex_error_to_response(&err);
+        let response = map_codex_error_to_response(&err, None);
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(
             response.headers().get(http::header::RETRY_AFTER).unwrap(),
@@ -2138,7 +2165,7 @@ mod tests {
             origin: client::CodexErrorOrigin::WebSocket,
         };
 
-        let response = map_codex_error_to_response(&err);
+        let response = map_codex_error_to_response(&err, None);
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -2158,7 +2185,7 @@ mod tests {
         assert_eq!(err.status, 503);
         assert_eq!(err.detail.as_deref(), Some(EMPTY_CODEX_COMPLETION_DETAIL));
         assert_eq!(
-            map_codex_error_to_response(&err).status(),
+            map_codex_error_to_response(&err, None).status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
     }

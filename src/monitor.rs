@@ -67,8 +67,29 @@ impl RequestStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QuotaStatus {
+    pub provider: String,
+    pub limited: bool,
+    /// Absolute unix-epoch seconds when the exhausted window reopens, when the
+    /// backend reported one. A dashboard treats the window as still exhausted
+    /// only while `now < resets_at`, so a provider clears itself once the clock
+    /// passes even if no further request is ever sent to it.
+    pub resets_at: Option<u64>,
+    pub window: Option<String>,
+    pub message: Option<String>,
+    pub updated_at: SystemTime,
+}
+
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
+    ProviderQuotaStatus {
+        provider: String,
+        limited: bool,
+        resets_at: Option<u64>,
+        window: Option<String>,
+        message: Option<String>,
+    },
     RequestStarted {
         request_id: String,
         session_id: Option<String>,
@@ -247,6 +268,7 @@ pub struct MonitorState {
     pub sessions: Vec<SessionSummary>,
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
+    pub quota: Vec<QuotaStatus>,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +317,7 @@ struct MonitorStore {
     session_usage: HashMap<Option<String>, SessionUsage>,
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
+    quota: HashMap<String, QuotaStatus>,
 }
 
 #[derive(Debug)]
@@ -337,6 +360,7 @@ impl MonitorHandle {
                 session_usage: HashMap::new(),
                 session_output_buckets: HashMap::new(),
                 recent_limit,
+                quota: HashMap::new(),
             })),
         }
     }
@@ -356,8 +380,30 @@ impl MonitorHandle {
                 sessions: Vec::new(),
                 active: Vec::new(),
                 recent: Vec::new(),
+                quota: Vec::new(),
             },
         }
+    }
+
+    /// Record a provider's usage-window state. `limited: false` is a manual
+    /// clear; a `limited: true` report with `resets_at` clears itself once
+    /// the snapshot is built after that clock passes, even with no further
+    /// traffic to the provider.
+    pub fn provider_quota_status(
+        &self,
+        provider: impl Into<String>,
+        limited: bool,
+        resets_at: Option<u64>,
+        window: Option<String>,
+        message: Option<String>,
+    ) {
+        self.publish(MonitorEvent::ProviderQuotaStatus {
+            provider: provider.into(),
+            limited,
+            resets_at,
+            window,
+            message,
+        });
     }
 
     pub fn request_started(
@@ -505,6 +551,25 @@ impl MonitorHandle {
 impl MonitorStore {
     fn apply(&mut self, event: MonitorEvent) {
         match event {
+            MonitorEvent::ProviderQuotaStatus {
+                provider,
+                limited,
+                resets_at,
+                window,
+                message,
+            } => {
+                self.quota.insert(
+                    provider.clone(),
+                    QuotaStatus {
+                        provider,
+                        limited,
+                        resets_at,
+                        window,
+                        message,
+                        updated_at: SystemTime::now(),
+                    },
+                );
+            }
             MonitorEvent::RequestStarted {
                 request_id,
                 session_id,
@@ -926,12 +991,31 @@ impl MonitorStore {
             &self.session_output_buckets,
             now,
         );
+        let mut quota: Vec<QuotaStatus> = self
+            .quota
+            .values()
+            .cloned()
+            .map(|mut status| {
+                if status.limited
+                    && let Some(resets_at) = status.resets_at
+                    && now
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .is_ok_and(|elapsed| elapsed.as_secs() >= resets_at)
+                {
+                    status.limited = false;
+                }
+                status
+            })
+            .collect();
+        quota.sort_by(|a, b| a.provider.cmp(&b.provider));
+
         MonitorState {
             started_at: self.started_at,
             uptime: self.started_instant.elapsed(),
             sessions,
             active,
             recent: self.recent.iter().cloned().collect(),
+            quota,
         }
     }
 }

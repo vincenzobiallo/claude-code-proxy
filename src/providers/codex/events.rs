@@ -24,6 +24,10 @@ pub(crate) struct CodexEventFailure {
     pub status: u16,
     pub message: String,
     pub retry_after: Option<String>,
+    /// The upstream `error.code` this failure was classified from, when one was
+    /// present (e.g. `insufficient_quota`). Kept so callers can react to a
+    /// specific code without re-matching on `message` text.
+    pub code: Option<String>,
 }
 
 impl CodexEventFailure {
@@ -147,6 +151,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
             status: 503,
             message: format!("Incomplete response returned, reason: {reason}"),
             retry_after: None,
+            code: None,
         });
     }
     let error = event_error(payload);
@@ -264,6 +269,7 @@ pub(crate) fn classify_event_failure(payload: &Value) -> Option<CodexEventFailur
         status,
         message,
         retry_after,
+        code: code.map(str::to_string),
     })
 }
 

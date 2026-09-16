@@ -5,8 +5,8 @@ use std::{
 };
 
 use super::{
-    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, RequestStatus, SessionUsage,
-    session_summaries,
+    ActiveRequest, CompletedRequest, EndpointKind, MonitorState, QuotaStatus, RequestStatus,
+    SessionUsage, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -369,12 +369,24 @@ fn mock_state_for_tick(
             .saturating_add(request.output_tokens.unwrap_or(0));
     }
     let sessions = session_summaries(&active, &recent, &session_usage, output_buckets, now);
+    let quota = vec![QuotaStatus {
+        provider: "codex".to_string(),
+        limited: true,
+        resets_at: (now + Duration::from_secs(3 * 3_600))
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs()),
+        window: Some("five_hour".to_string()),
+        message: Some("Codex 5-hour usage window exhausted".to_string()),
+        updated_at: now,
+    }];
     MonitorState {
         started_at,
         uptime: now.duration_since(started_at).unwrap_or_default(),
         sessions,
         active,
         recent: recent.into_iter().collect(),
+        quota,
     }
 }
 

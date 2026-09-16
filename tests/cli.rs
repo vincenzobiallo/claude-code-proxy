@@ -52,7 +52,7 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
     let stdout = String::from_utf8(output.stdout)?;
     for description in [
         "Print version information",
-        "Start the proxy server and monitor",
+        "Start the proxy server and web dashboard",
         "List supported provider models",
         "Manage Codex authentication",
         "Manage Kimi authentication",

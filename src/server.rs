@@ -260,6 +260,7 @@ pub fn app_with_features(
         images,
         transcriptions,
     });
+    let dashboard_router = crate::dashboard::router(state.registry.clone());
     let router = Router::new()
         .route("/healthz", get(healthz))
         .route("/monitor", get(handler_monitor))
@@ -292,7 +293,10 @@ pub fn app_with_features(
     } else {
         router
     };
-    router.fallback(fallback_handler).with_state(state)
+    router
+        .fallback(fallback_handler)
+        .with_state(state)
+        .merge(dashboard_router)
 }
 
 #[derive(Clone)]

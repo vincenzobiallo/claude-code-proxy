@@ -1,12 +1,11 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config, logging,
+    config,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
-    tui::{self, MonitorExit, MonitorUiConfig},
 };
 use std::io::IsTerminal;
 
@@ -31,21 +30,13 @@ struct Cli {
 enum Commands {
     /// Print version information
     Version,
-    /// Start the proxy server and monitor
+    /// Start the proxy server and web dashboard
     Serve {
         #[arg(long)]
         port: Option<u16>,
         #[arg(long = "no-monitor", action = ArgAction::SetTrue)]
         no_monitor: bool,
     },
-    /// Attach a read-only dashboard to a running proxy
-    Monitor {
-        #[arg(long)]
-        url: Option<reqwest::Url>,
-    },
-    /// Open the monitor TUI with mock data and no proxy server
-    #[command(hide = true)]
-    Demo,
     /// List supported provider models
     Models {
         #[arg(long)]
@@ -106,81 +97,20 @@ fn main() -> Result<()> {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            match select_serve_mode(std::io::stdout().is_terminal(), no_monitor) {
-                ServeMode::Plain => {
-                    print_server_banner(&bind_address, effective_port, &registry);
-                    runtime
-                        .block_on(run_service(ServerConfig {
-                            bind_address,
-                            port: effective_port,
-                            monitor: Some(MonitorHandle::default()),
-                        }))
-                        .map_err(|err| anyhow::anyhow!(err))
-                }
-                ServeMode::Monitor => {
-                    let _stderr_guard = logging::suppress_stderr();
-                    let monitor = MonitorHandle::default();
-                    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                    let (shutdown_complete_tx, shutdown_complete_rx) = std::sync::mpsc::channel();
-                    let listener = runtime
-                        .block_on(server::bind_proxy_listener(&bind_address, effective_port))?;
-                    let local_addr = listener.local_addr()?;
-                    let monitor_listen_url =
-                        listen_url(&local_addr.ip().to_string(), local_addr.port());
-                    let server_monitor = monitor.clone();
-                    let server_task = runtime.spawn(async move {
-                        let result =
-                            server::serve_listener(listener, Some(server_monitor), async move {
-                                let _ = shutdown_rx.await;
-                            })
-                            .await;
-                        let _ = shutdown_complete_tx.send(());
-                        result
-                    });
-                    let ui_result = tui::run_monitor(
-                        monitor,
-                        MonitorUiConfig {
-                            listen_url: monitor_listen_url,
-                            port: effective_port,
-                            registry: &registry,
-                            shutdown: Some(shutdown_tx),
-                            shutdown_complete: Some(shutdown_complete_rx),
-                        },
-                    );
-                    if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
-                        server_task.abort();
-                        let _ = runtime.block_on(server_task);
-                        std::process::exit(130);
-                    }
-                    let server_result = runtime.block_on(server_task)?;
-                    ui_result?;
-                    server_result.map_err(|err| anyhow::anyhow!(err))
-                }
+            print_server_banner(&bind_address, effective_port, &registry);
+            if should_open_dashboard(std::io::stdout().is_terminal(), no_monitor) {
+                open_browser(&format!(
+                    "{}/dashboard",
+                    listen_url(&bind_address, effective_port)
+                ));
             }
-        }
-        Commands::Demo => {
-            let registry = Registry::with_default_alias();
-            tui::run_mock_monitor(config::port(), &registry)
-        }
-        Commands::Monitor { url } => {
-            let url = url.unwrap_or_else(|| {
-                format!("http://127.0.0.1:{}", config::port())
-                    .parse()
-                    .expect("local proxy URL")
-            });
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(std::time::Duration::from_secs(2))
-                .build()?;
-            let monitor = runtime.block_on(
-                claude_code_proxy::monitor::remote::RemoteMonitor::connect(client, url.clone()),
-            )?;
-            tui::run_attached_monitor(|| monitor.snapshot(), url.to_string())?;
-            Ok(())
+            runtime
+                .block_on(run_service(ServerConfig {
+                    bind_address,
+                    port: effective_port,
+                    monitor: Some(MonitorHandle::default()),
+                }))
+                .map_err(|err| anyhow::anyhow!(err))
         }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
@@ -272,17 +202,33 @@ impl ServiceShutdownSignals {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeMode {
-    Monitor,
-    Plain,
+/// Auto-opening a browser tab only makes sense for someone sitting at an
+/// interactive terminal; a background/service launch (non-tty stdout) or an
+/// explicit `--no-monitor` should leave the dashboard reachable without
+/// popping a window.
+fn should_open_dashboard(stdout_is_tty: bool, no_monitor: bool) -> bool {
+    stdout_is_tty && !no_monitor
 }
 
-fn select_serve_mode(stdout_is_tty: bool, no_monitor: bool) -> ServeMode {
-    if stdout_is_tty && !no_monitor {
-        ServeMode::Monitor
-    } else {
-        ServeMode::Plain
+fn open_browser(url: &str) {
+    let result = {
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("cmd")
+                .args(["/C", "start", "", url])
+                .status()
+        }
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open").arg(url).status()
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            std::process::Command::new("xdg-open").arg(url).status()
+        }
+    };
+    if let Err(err) = result {
+        eprintln!("Could not open a browser automatically ({err}); open {url} manually.");
     }
 }
 
@@ -372,6 +318,10 @@ fn listen_url(bind_address: &str, port: u16) -> String {
 
 fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     println!("Proxy listening on {}", listen_url(bind_address, port));
+    println!(
+        "Dashboard: {}/dashboard",
+        listen_url(bind_address, port)
+    );
     println!("Logs: {}", paths::log_file().display());
     let cfg = paths::config_dir();
     if cfg.exists() {
@@ -379,12 +329,18 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
     }
     print_models(registry, false);
     println!();
-    println!("Configure Claude Code (pick a model from above):");
+    println!("Configure Claude Code:");
     println!("  export ANTHROPIC_BASE_URL=\"http://localhost:{port}\"");
-    println!("  export ANTHROPIC_AUTH_TOKEN=\"anything\"");
-    println!("  export ANTHROPIC_MODEL=\"gpt-5.6-sol\"");
-    println!("  export ANTHROPIC_SMALL_FAST_MODEL=\"gpt-5.6-luna\"");
-    println!("  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
+    println!();
+    println!("Do not set ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY - either one overrides");
+    println!("the Claude subscription login and the Claude route returns 401.");
+    println!();
+    println!("Do not set ANTHROPIC_MODEL or ANTHROPIC_SMALL_FAST_MODEL either - that");
+    println!("overrides Claude Code's native Opus/Sonnet/Haiku/Fable slots. Instead, open");
+    println!("the dashboard above, pick your models, and copy the generated JSON into");
+    println!("modelPicker.options in ~/.claude/settings.json.");
+    println!();
+    println!("Optional: export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1");
 }
 
 #[allow(dead_code)]
@@ -397,25 +353,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_serve_selects_monitor_on_tty() {
-        assert_eq!(select_serve_mode(true, false), ServeMode::Monitor);
+    fn default_serve_opens_dashboard_on_tty() {
+        assert!(should_open_dashboard(true, false));
     }
 
     #[test]
-    fn no_monitor_selects_plain_mode() {
-        assert_eq!(select_serve_mode(true, true), ServeMode::Plain);
+    fn no_monitor_skips_dashboard() {
+        assert!(!should_open_dashboard(true, true));
     }
 
     #[test]
-    fn non_tty_stdout_selects_plain_mode() {
-        assert_eq!(select_serve_mode(false, false), ServeMode::Plain);
-    }
-
-    #[test]
-    fn demo_command_parses_without_server_options() {
-        let cli = Cli::try_parse_from(["claude-code-proxy", "demo"]).unwrap();
-
-        assert!(matches!(cli.command, Some(Commands::Demo)));
+    fn non_tty_stdout_skips_dashboard() {
+        assert!(!should_open_dashboard(false, false));
     }
 
     #[tokio::test]

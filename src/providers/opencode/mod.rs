@@ -505,6 +505,7 @@ mod tests {
             session_seq: None,
             monitor: None,
             traffic: None,
+            passthrough: None,
         }
     }
 

@@ -3534,6 +3534,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+            passthrough: None,
         };
         let mut events = codex_websocket_event_stream(
             &test_websocket_client(),

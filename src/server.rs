@@ -582,6 +582,7 @@ async fn handler_transcription(State(state): State<Arc<AppState>>, req: Request<
         provider: "codex".to_string(),
         traffic: None,
         monitor: state.monitor.clone(),
+        passthrough: None,
     };
     let response = match state.transcriptions.as_ref() {
         Some(backend) => backend.handle(prepared, context).await,
@@ -757,6 +758,7 @@ async fn dispatch_image_request(
         provider: "codex".to_string(),
         traffic: None,
         monitor: state.monitor.clone(),
+        passthrough: None,
     };
     let response = match state.images.as_ref() {
         Some(backend) => backend.handle(operation, prepared, context).await,
@@ -1033,6 +1035,7 @@ async fn handler_responses(State(state): State<Arc<AppState>>, req: Request<Body
         provider: provider.name().to_string(),
         traffic: traffic.clone(),
         monitor: state.monitor.clone(),
+        passthrough: None,
     };
     let response = if let Some(parsed) = parsed {
         match provider
@@ -1273,6 +1276,7 @@ async fn handler_chat_completions(
         provider: provider.name().to_string(),
         traffic: traffic.clone(),
         monitor: state.monitor.clone(),
+        passthrough: None,
     };
     let response = if let Some(translated) = translated {
         match state.chat_completions.as_ref() {
@@ -1759,6 +1763,14 @@ async fn dispatch_request(
         provider: provider.name().to_string(),
         traffic,
         monitor: state.monitor.clone(),
+        passthrough: Some(crate::provider::Passthrough {
+            raw_body: body_bytes,
+            headers,
+            path_and_query: uri
+                .path_and_query()
+                .map(|pq| pq.as_str().to_string())
+                .unwrap_or_else(|| path.clone()),
+        }),
     };
 
     let response = if count_tokens {

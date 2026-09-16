@@ -310,6 +310,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: Some(monitor),
+            passthrough: None,
         }
     }
 

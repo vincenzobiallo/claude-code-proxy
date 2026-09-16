@@ -816,6 +816,7 @@ mod tests {
                     provider: "codex".into(),
                     traffic: None,
                     monitor: None,
+                    passthrough: None,
                 },
             )
             .await;
@@ -877,6 +878,7 @@ mod tests {
                     provider: "codex".into(),
                     traffic: None,
                     monitor: None,
+                    passthrough: None,
                 },
             )
             .await;

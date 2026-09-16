@@ -253,7 +253,7 @@ fn alias_provider_has_expected_default() {
     )]);
     assert!(matches!(
         load_config_for_env(&env).alias_provider,
-        AliasProvider::Codex
+        AliasProvider::Anthropic
     ));
 }
 

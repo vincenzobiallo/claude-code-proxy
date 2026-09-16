@@ -7,6 +7,7 @@ use crate::paths;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasProvider {
+    Anthropic,
     Codex,
     Kimi,
 }
@@ -14,6 +15,7 @@ pub enum AliasProvider {
 impl AliasProvider {
     pub fn as_str(&self) -> &str {
         match self {
+            AliasProvider::Anthropic => "anthropic",
             AliasProvider::Codex => "codex",
             AliasProvider::Kimi => "kimi",
         }
@@ -122,6 +124,7 @@ struct FileLog {
 
 fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
+        "anthropic" => Some(AliasProvider::Anthropic),
         "codex" => Some(AliasProvider::Codex),
         "kimi" => Some(AliasProvider::Kimi),
         _ => None,
@@ -161,7 +164,7 @@ fn load_config_from_env(env: &HashMap<String, String>, config_dir: PathBuf) -> L
     let mut out = LoadedConfig {
         bind_address: "127.0.0.1".to_string(),
         port: 18765,
-        alias_provider: AliasProvider::Codex,
+        alias_provider: AliasProvider::Anthropic,
         log_verbose: false,
         log_stderr: false,
         config_dir: config_dir.clone(),
@@ -573,6 +576,14 @@ pub fn opencode_base_url() -> String {
 
 pub fn is_verbose() -> bool {
     log_verbose()
+}
+
+pub fn anthropic_base_url() -> String {
+    let env: HashMap<_, _> = std::env::vars().collect();
+    if let Some(raw) = env.get("CCP_ANTHROPIC_BASE_URL") {
+        return raw.clone();
+    }
+    "https://api.anthropic.com".to_string()
 }
 
 pub fn kimi_oauth_host() -> String {

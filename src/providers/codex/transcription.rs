@@ -372,6 +372,7 @@ mod tests {
             provider: "codex".to_string(),
             traffic: None,
             monitor: None,
+            passthrough: None,
         }
     }
 

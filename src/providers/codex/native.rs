@@ -616,6 +616,7 @@ mod tests {
             provider: "codex".into(),
             traffic: None,
             monitor: None,
+            passthrough: None,
         }
     }
 

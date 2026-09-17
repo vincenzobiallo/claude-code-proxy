@@ -111,7 +111,15 @@ impl ProviderError {
 pub trait CliHandlers: Send + Sync {
     fn login(&self) -> Result<()>;
     fn device(&self) -> Result<()>;
-    fn status(&self) -> Result<()>;
+    /// Human-readable auth status (multi-line), or an error describing why the
+    /// provider isn't authenticated. Never prints: the CLI prints it for a
+    /// terminal invocation, while the dashboard's auth endpoint serializes it
+    /// into JSON on every poll and must not spam the server's own stdout.
+    fn status_text(&self) -> Result<String>;
+    fn status(&self) -> Result<()> {
+        println!("{}", self.status_text()?);
+        Ok(())
+    }
     fn logout(&self) -> Result<()>;
 }
 

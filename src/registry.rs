@@ -249,12 +249,12 @@ impl CliHandlers for PlaceholderCli {
         Err(anyhow!("{}: device login not supported", self.provider))
     }
 
-    fn status(&self) -> Result<()> {
+    fn status_text(&self) -> Result<String> {
         use serde_json::Value;
         let path = crate::paths::provider_auth_file(self.provider);
         let legacy = crate::paths::provider_legacy_auth_file(self.provider);
         if crate::auth::load_auth_file_with_legacy::<Value>(&path, &legacy).is_some() {
-            Ok(())
+            Ok(format!("{}: authenticated", self.provider))
         } else {
             Err(anyhow!("Not authenticated"))
         }

@@ -78,8 +78,8 @@ impl CliHandlers for FakeCli {
         Ok(())
     }
 
-    fn status(&self) -> anyhow::Result<()> {
-        Ok(())
+    fn status_text(&self) -> anyhow::Result<String> {
+        Ok(String::new())
     }
 
     fn logout(&self) -> anyhow::Result<()> {

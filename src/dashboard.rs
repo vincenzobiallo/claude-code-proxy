@@ -125,8 +125,8 @@ async fn dashboard_auth(
         let Some(provider) = state.registry.provider(&name) else {
             continue;
         };
-        let (connected, detail) = match provider.cli().status() {
-            Ok(()) => (true, None),
+        let (connected, detail) = match provider.cli().status_text() {
+            Ok(text) => (true, Some(text)),
             Err(err) => (false, Some(err.to_string())),
         };
         out.push(AuthStatus {

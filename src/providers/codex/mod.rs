@@ -1619,19 +1619,16 @@ impl CliHandlers for CodexCli {
         Ok(())
     }
 
-    fn status(&self) -> Result<(), anyhow::Error> {
+    fn status_text(&self) -> Result<String, anyhow::Error> {
         let store = file_store();
         let stored = store.load_auth()?;
         match stored {
-            Some(auth) => {
-                println!(
-                    "Account: {}",
-                    auth.account_id.as_deref().unwrap_or("(none)")
-                );
-                println!("{}", format_expiry(auth.expires, now_ms()));
-                println!("Storage: {}", store.auth_path());
-                Ok(())
-            }
+            Some(auth) => Ok(format!(
+                "Account: {}\n{}\nStorage: {}",
+                auth.account_id.as_deref().unwrap_or("(none)"),
+                format_expiry(auth.expires, now_ms()),
+                store.auth_path()
+            )),
             None => {
                 anyhow::bail!("Not authenticated");
             }

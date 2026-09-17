@@ -300,10 +300,10 @@ impl CliHandlers for AnthropicCli {
             "The Claude backend reuses Claude Code's own login; no separate authentication is required"
         )
     }
-    fn status(&self) -> anyhow::Result<()> {
-        println!("Claude backend: transparent passthrough to api.anthropic.com");
-        println!("Auth: forwarded from Claude Code (no proxy credentials stored)");
-        Ok(())
+    fn status_text(&self) -> anyhow::Result<String> {
+        Ok("Claude backend: transparent passthrough to api.anthropic.com\n\
+            Auth: forwarded from Claude Code (no proxy credentials stored)"
+            .to_string())
     }
     fn logout(&self) -> anyhow::Result<()> {
         println!("Claude backend stores no credentials; nothing to remove");

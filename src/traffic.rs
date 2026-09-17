@@ -470,6 +470,10 @@ fn set_mode(path: &Path, mode: u32) {
             let _ = fs::set_permissions(path, perm);
         }
     }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
 }
 
 #[allow(dead_code)]

@@ -94,6 +94,20 @@ pub fn provider_legacy_auth_file(provider: &str) -> PathBuf {
     legacy_config_dir(&deps).join(provider).join("auth.json")
 }
 
+/// Where the terminal Models view persists its `[v]` selection and ordering,
+/// independent of whether that's ever been applied to `settings.json`.
+pub fn model_picker_file() -> PathBuf {
+    resolve_config_dir(&DirResolverEnv::default()).join("model_picker.json")
+}
+
+/// Claude Code's own settings file - not ours, but where `modelPicker.options`
+/// lives, so the TUI's "overwrite settings.json" action targets this path.
+pub fn claude_settings_file() -> PathBuf {
+    Path::new(&DirResolverEnv::default().home)
+        .join(".claude")
+        .join("settings.json")
+}
+
 fn join_with_sep(base: &str, parts: &[&str], win32: bool) -> PathBuf {
     let sep = '/';
     let _ = win32;

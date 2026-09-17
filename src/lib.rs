@@ -2,7 +2,9 @@ pub mod anthropic;
 pub mod auth;
 pub mod config;
 pub mod dashboard;
+pub mod instance_lock;
 pub mod logging;
+pub mod model_picker;
 pub mod monitor;
 pub mod openai_compat;
 pub mod paths;
@@ -15,6 +17,7 @@ pub mod retry;
 pub mod server;
 pub mod session;
 pub mod traffic;
+pub mod tui;
 
 pub use crate::anthropic::error::{ErrorDetail, ErrorEnvelope, json_error};
 pub use crate::anthropic::schema::MessagesRequest;

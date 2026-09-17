@@ -17,7 +17,7 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
     let expected = format!("claude-code-proxy {}", env!("CARGO_PKG_VERSION"));
 
     for arg in ["--version", "-v", "version"] {
-        let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+        let mut cmd = Command::cargo_bin("ccp")?;
         cmd.arg(arg)
             .assert()
             .success()
@@ -28,7 +28,7 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let mut cmd = Command::cargo_bin("ccp")?;
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
@@ -37,7 +37,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!out.contains("cursor:"));
     assert!(!out.contains("grok:"));
 
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let mut cmd = Command::cargo_bin("ccp")?;
     cmd.args(["models", "--full"]);
     cmd.output()?;
     Ok(())
@@ -45,7 +45,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::error::Error>> {
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let mut cmd = Command::cargo_bin("ccp")?;
     cmd.arg("--help");
     let output = cmd.output()?;
     assert!(output.status.success());
@@ -73,7 +73,7 @@ fn help_describes_visible_commands_and_hides_demo() -> Result<(), Box<dyn std::e
 
 #[test]
 fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("claude-code-proxy")?
+    Command::cargo_bin("ccp")?
         .arg("definitely-not-a-command")
         .assert()
         .failure()
@@ -84,7 +84,7 @@ fn invalid_command_exits_two() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let mut cmd = Command::cargo_bin("ccp")?;
     cmd.args(["codex", "auth", "logout"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success();
@@ -176,7 +176,7 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
         r#"{"access":"test","refresh":"test","expires":4102444800000,"account_id":"acct_test"}"#,
     )?;
     let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-    let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_ccp"))
         .args(["serve", "--no-monitor", "--port", &port.to_string()])
         .env("CCP_CONFIG_DIR", config.path())
         .env("CCP_CODEX_BASE_URL", upstream_url)
@@ -231,7 +231,7 @@ fn codex_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error
         auth_dir.join("auth.json"),
         r#"{"access":"a","refresh":"r","expires":4102444800000,"account_id":"acct_test"}"#,
     )?;
-    let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    let mut cmd = Command::cargo_bin("ccp")?;
     cmd.args(["codex", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success().stdout(contains("acct_test"));

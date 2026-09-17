@@ -1,11 +1,12 @@
 use anyhow::Result;
 use clap::{ArgAction, Parser, Subcommand};
 use claude_code_proxy::{
-    config,
+    config, instance_lock, logging,
     monitor::MonitorHandle,
     paths,
     registry::{ANTHROPIC_STYLE_ALIASES, Registry},
     server::{self, ServerConfig},
+    tui::{self, MonitorExit, MonitorUiConfig},
 };
 use std::io::IsTerminal;
 
@@ -76,26 +77,25 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Serve { port, no_monitor } => {
+            let _instance_lock = instance_lock::acquire(&paths::config_dir())?;
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            print_server_banner(&bind_address, effective_port, &registry);
-            if should_open_dashboard(std::io::stdout().is_terminal(), no_monitor) {
-                open_browser(&format!(
-                    "{}/dashboard",
-                    listen_url(&bind_address, effective_port)
-                ));
+            if should_run_tui(std::io::stdout().is_terminal(), no_monitor) {
+                run_serve_with_tui(&runtime, &bind_address, effective_port, &registry)
+            } else {
+                print_server_banner(&bind_address, effective_port, &registry);
+                runtime
+                    .block_on(run_service(ServerConfig {
+                        bind_address,
+                        port: effective_port,
+                        monitor: Some(MonitorHandle::default()),
+                    }))
+                    .map_err(|err| anyhow::anyhow!(err))
             }
-            runtime
-                .block_on(run_service(ServerConfig {
-                    bind_address,
-                    port: effective_port,
-                    monitor: Some(MonitorHandle::default()),
-                }))
-                .map_err(|err| anyhow::anyhow!(err))
         }
         Commands::Models { full } => {
             print_models(&Registry::with_default_alias(), full);
@@ -184,34 +184,60 @@ impl ServiceShutdownSignals {
     }
 }
 
-/// Auto-opening a browser tab only makes sense for someone sitting at an
+/// The live terminal dashboard only makes sense for someone sitting at an
 /// interactive terminal; a background/service launch (non-tty stdout) or an
-/// explicit `--no-monitor` should leave the dashboard reachable without
-/// popping a window.
-fn should_open_dashboard(stdout_is_tty: bool, no_monitor: bool) -> bool {
+/// explicit `--no-monitor` should leave the HTML dashboard reachable over
+/// HTTP without taking over the screen.
+fn should_run_tui(stdout_is_tty: bool, no_monitor: bool) -> bool {
     stdout_is_tty && !no_monitor
 }
 
-fn open_browser(url: &str) {
-    let result = {
-        #[cfg(target_os = "windows")]
-        {
-            std::process::Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .status()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("open").arg(url).status()
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            std::process::Command::new("xdg-open").arg(url).status()
-        }
-    };
-    if let Err(err) = result {
-        eprintln!("Could not open a browser automatically ({err}); open {url} manually.");
+/// Runs the proxy with the terminal dashboard in the foreground. The HTTP
+/// server runs on a background task; the TUI drives shutdown by sending on
+/// `shutdown_tx` (graceful) or aborting the task directly (force quit on a
+/// second ctrl+c). Mirrors `run_service`'s double-signal semantics, but the
+/// "signal" here is a key event read by crossterm's raw mode instead of an
+/// OS signal, which is what makes it work identically on Windows.
+fn run_serve_with_tui(
+    runtime: &tokio::runtime::Runtime,
+    bind_address: &str,
+    port: u16,
+    registry: &Registry,
+) -> Result<()> {
+    let _stderr_guard = logging::suppress_stderr();
+    let monitor = MonitorHandle::default();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (shutdown_complete_tx, shutdown_complete_rx) = std::sync::mpsc::channel();
+    let listener = runtime.block_on(server::bind_proxy_listener(bind_address, port))?;
+    let local_addr = listener.local_addr()?;
+    let monitor_listen_url = listen_url(&local_addr.ip().to_string(), local_addr.port());
+    let server_monitor = monitor.clone();
+    let server_task = runtime.spawn(async move {
+        let result = server::serve_listener(listener, Some(server_monitor), async move {
+            let _ = shutdown_rx.await;
+        })
+        .await;
+        let _ = shutdown_complete_tx.send(());
+        result
+    });
+
+    let ui_result = tui::run_monitor(
+        monitor,
+        MonitorUiConfig {
+            listen_url: monitor_listen_url,
+            registry,
+            shutdown: Some(shutdown_tx),
+            shutdown_complete: Some(shutdown_complete_rx),
+        },
+    );
+    if matches!(&ui_result, Ok(MonitorExit::ForceQuit)) {
+        server_task.abort();
+        let _ = runtime.block_on(server_task);
+        std::process::exit(130);
     }
+    let server_result = runtime.block_on(server_task)?;
+    ui_result?;
+    server_result.map_err(|err| anyhow::anyhow!(err))
 }
 
 fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
@@ -309,18 +335,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_serve_opens_dashboard_on_tty() {
-        assert!(should_open_dashboard(true, false));
+    fn default_serve_runs_tui_on_tty() {
+        assert!(should_run_tui(true, false));
     }
 
     #[test]
-    fn no_monitor_skips_dashboard() {
-        assert!(!should_open_dashboard(true, true));
+    fn no_monitor_skips_tui() {
+        assert!(!should_run_tui(true, true));
     }
 
     #[test]
-    fn non_tty_stdout_skips_dashboard() {
-        assert!(!should_open_dashboard(false, false));
+    fn non_tty_stdout_skips_tui() {
+        assert!(!should_run_tui(false, false));
     }
 
     #[tokio::test]

@@ -9,7 +9,6 @@ use crate::paths;
 pub enum AliasProvider {
     Anthropic,
     Codex,
-    Kimi,
 }
 
 impl AliasProvider {
@@ -17,7 +16,6 @@ impl AliasProvider {
         match self {
             AliasProvider::Anthropic => "anthropic",
             AliasProvider::Codex => "codex",
-            AliasProvider::Kimi => "kimi",
         }
     }
 }
@@ -42,11 +40,7 @@ struct FileConfig {
     #[serde(rename = "autoReviewModel")]
     pub auto_review_model: Option<String>,
     pub log: Option<FileLog>,
-    pub kimi: Option<KimiConfig>,
     pub codex: Option<CodexConfig>,
-    pub cursor: Option<CursorConfig>,
-    pub grok: Option<GrokConfig>,
-    pub opencode: Option<OpenCodeConfig>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -80,42 +74,6 @@ struct CodexConfig {
     pub transport: Option<String>,
 }
 
-#[derive(Deserialize, Clone)]
-struct CursorConfig {
-    #[serde(rename = "baseUrl")]
-    pub base_url: Option<String>,
-    #[serde(rename = "clientVersion")]
-    pub client_version: Option<String>,
-    #[serde(rename = "agentBundle")]
-    pub agent_bundle: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct KimiConfig {
-    #[serde(rename = "userAgent")]
-    pub user_agent: Option<String>,
-    #[serde(rename = "oauthHost")]
-    pub oauth_host: Option<String>,
-    #[serde(rename = "baseUrl")]
-    pub base_url: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct GrokConfig {
-    #[serde(rename = "baseUrl")]
-    pub base_url: Option<String>,
-    #[serde(rename = "clientVersion")]
-    pub client_version: Option<String>,
-}
-
-#[derive(Deserialize, Clone)]
-struct OpenCodeConfig {
-    #[serde(rename = "apiKey")]
-    pub api_key: Option<String>,
-    #[serde(rename = "baseUrl")]
-    pub base_url: Option<String>,
-}
-
 #[derive(Deserialize)]
 struct FileLog {
     pub verbose: Option<bool>,
@@ -126,7 +84,6 @@ fn parse_alias(raw: &str) -> Option<AliasProvider> {
     match raw {
         "anthropic" => Some(AliasProvider::Anthropic),
         "codex" => Some(AliasProvider::Codex),
-        "kimi" => Some(AliasProvider::Kimi),
         _ => None,
     }
 }
@@ -272,35 +229,6 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_TRANSCRIPTIONS_API") {
         out.push("codex.transcriptionsApi (env)".to_string());
     }
-    if env.contains_key("CCP_KIMI_OAUTH_HOST") {
-        out.push("kimi.oauthHost (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_BASE_URL") {
-        out.push("kimi.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CURSOR_BASE_URL") {
-        out.push("cursor.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_CURSOR_CLIENT_VERSION") {
-        out.push("cursor.clientVersion (env)".to_string());
-    }
-    if env.contains_key("CCP_KIMI_USER_AGENT") {
-        out.push("kimi.userAgent (env)".to_string());
-    }
-    if env.contains_key("CCP_GROK_BASE_URL") {
-        out.push("grok.baseUrl (env)".to_string());
-    }
-    if env.contains_key("CCP_GROK_CLIENT_VERSION") {
-        out.push("grok.clientVersion (env)".to_string());
-    }
-    if env.contains_key("CCP_OPENCODE_API_KEY") {
-        out.push("opencode.apiKey (env)".to_string());
-    } else if env.contains_key("OPENCODE_API_KEY") {
-        out.push("opencode.apiKey (OpenCode env)".to_string());
-    }
-    if env.contains_key("CCP_OPENCODE_BASE_URL") {
-        out.push("opencode.baseUrl (env)".to_string());
-    }
     if env
         .get("CCP_CODEX_REASONING_SUMMARY")
         .is_some_and(|raw| !raw.is_empty())
@@ -340,14 +268,6 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
                 out.push(format!("log.stderr: {v}"));
             }
         }
-        if let Some(opencode) = file_cfg.opencode {
-            if opencode.api_key.is_some_and(|raw| !raw.is_empty()) {
-                out.push("opencode.apiKey (config)".to_string());
-            }
-            if let Some(url) = opencode.base_url.filter(|raw| !raw.is_empty()) {
-                out.push(format!("opencode.baseUrl: {url}"));
-            }
-        }
         if let Some(codex) = file_cfg.codex {
             if codex
                 .reasoning_summary
@@ -375,205 +295,6 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     out
 }
 
-pub fn grok_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_GROK_BASE_URL") {
-        return raw.clone();
-    }
-    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|f| f.grok)
-        && let Some(url) = grok.base_url
-    {
-        return url;
-    }
-    "https://cli-chat-proxy.grok.com/v1".to_string()
-}
-
-pub fn grok_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_GROK_CLIENT_VERSION") {
-        return raw.clone();
-    }
-    if let Some(grok) = read_file_config(&paths::config_dir()).and_then(|f| f.grok)
-        && let Some(version) = grok.client_version
-    {
-        return version;
-    }
-    "0.2.93".to_string()
-}
-
-// ---------------------------------------------------------------------------
-// Grok tool-image policy (CCP_GROK_TOOL_IMAGE)
-// ---------------------------------------------------------------------------
-
-/// How the Grok translator treats Anthropic `image` blocks (tool results and
-/// top-level user messages). `omit` is the safe default: degrade to the L1
-/// placeholder string. `reattach` keeps the placeholder in the tool output and
-/// additionally appends a user message carrying the images as `input_image`
-/// data URLs. `inline` sends the tool output itself as an array of
-/// `input_text` + `input_image` parts (string-only outputs still serialize as
-/// plain strings). `reject` restores the pre-L1 hard error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrokToolImageMode {
-    Omit,
-    Reattach,
-    Inline,
-    Reject,
-}
-
-pub fn parse_grok_tool_image_mode(raw: Option<&str>) -> GrokToolImageMode {
-    match raw.map(str::trim) {
-        Some("reattach") => GrokToolImageMode::Reattach,
-        Some("inline") => GrokToolImageMode::Inline,
-        Some("reject") => GrokToolImageMode::Reject,
-        // Any unknown/empty value degrades to the safe default.
-        _ => GrokToolImageMode::Omit,
-    }
-}
-
-pub fn grok_tool_image_mode() -> GrokToolImageMode {
-    parse_grok_tool_image_mode(std::env::var("CCP_GROK_TOOL_IMAGE").ok().as_deref())
-}
-
-/// Warn once at startup when an unknown mode was requested. Called from the
-/// Grok provider constructor rather than per request.
-pub fn warn_grok_tool_image_mode_once(log: &crate::logging::Logger) {
-    match std::env::var("CCP_GROK_TOOL_IMAGE")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some(other) if !matches!(other, "" | "omit" | "reattach" | "inline" | "reject") => {
-            let mut fields = serde_json::Map::new();
-            fields.insert(
-                "value".to_string(),
-                serde_json::Value::String(other.to_string()),
-            );
-            log.warn(
-                "unrecognized CCP_GROK_TOOL_IMAGE value; falling back to omit",
-                Some(fields),
-            );
-        }
-        _ => {}
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Grok hosted-search policy (CCP_GROK_HOSTED_SEARCH)
-// ---------------------------------------------------------------------------
-
-/// Whether the Grok translator replaces caller search tools with xAI-hosted
-/// search and requires hosted tool use on explicit search turns.
-///
-/// The disabled policy preserves caller tools, instructions, and tool choice.
-/// It adds `x_search` only to X-specific turns because the caller has no
-/// equivalent access to xAI's X index.
-///
-/// The enabled policy favors xAI-hosted search and citations. Hosted tools
-/// replace caller search implementations, matching turns receive search
-/// guidance, and explicit search turns use `tool_choice: required`.
-///
-/// Set `CCP_GROK_HOSTED_SEARCH` to `1`, `on`, or `true` to enable this policy.
-pub fn parse_grok_hosted_search(raw: Option<&str>) -> bool {
-    matches!(raw.map(str::trim), Some("1" | "on" | "true"))
-}
-
-pub fn grok_hosted_search() -> bool {
-    parse_grok_hosted_search(std::env::var("CCP_GROK_HOSTED_SEARCH").ok().as_deref())
-}
-
-// ---------------------------------------------------------------------------
-// Grok hosted-search block shape (CCP_GROK_SEARCH_BLOCKS)
-// ---------------------------------------------------------------------------
-
-/// How a hosted search that xAI ran is reported to the client.
-///
-/// `Text` projects the search query into a standard `text` block.
-///
-/// `Native` preserves the Anthropic server-tool shape: `server_tool_use`
-/// followed by `web_search_tool_result` or `x_search_tool_result`. Select this
-/// shape for clients that consume hosted-tool blocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrokSearchBlocks {
-    Text,
-    Native,
-}
-
-pub fn parse_grok_search_blocks(raw: Option<&str>) -> GrokSearchBlocks {
-    match raw.map(str::trim) {
-        Some("native") => GrokSearchBlocks::Native,
-        // Text is the compatibility-safe fallback for empty or unknown values.
-        _ => GrokSearchBlocks::Text,
-    }
-}
-
-pub fn grok_search_blocks() -> GrokSearchBlocks {
-    parse_grok_search_blocks(std::env::var("CCP_GROK_SEARCH_BLOCKS").ok().as_deref())
-}
-
-struct ResolvedOpenCodeConfig {
-    api_key: Option<String>,
-    api_key_source: Option<&'static str>,
-    base_url: String,
-}
-
-fn resolve_opencode_config(
-    env: &HashMap<String, String>,
-    config_dir: &Path,
-) -> ResolvedOpenCodeConfig {
-    let file = read_file_config(config_dir).and_then(|file| file.opencode);
-    let file_key = file
-        .as_ref()
-        .and_then(|config| config.api_key.as_ref())
-        .filter(|value| !value.is_empty());
-    let (api_key, api_key_source) = if let Some(value) = env
-        .get("CCP_OPENCODE_API_KEY")
-        .filter(|value| !value.is_empty())
-    {
-        (Some(value.clone()), Some("CCP_OPENCODE_API_KEY"))
-    } else if let Some(value) = env
-        .get("OPENCODE_API_KEY")
-        .filter(|value| !value.is_empty())
-    {
-        (Some(value.clone()), Some("OPENCODE_API_KEY"))
-    } else if let Some(value) = file_key {
-        (Some(value.clone()), Some("config.json"))
-    } else {
-        (None, None)
-    };
-    let base_url = env
-        .get("CCP_OPENCODE_BASE_URL")
-        .filter(|value| !value.is_empty())
-        .cloned()
-        .or_else(|| {
-            file.as_ref()
-                .and_then(|config| config.base_url.as_ref())
-                .filter(|value| !value.is_empty())
-                .cloned()
-        })
-        .unwrap_or_else(|| "https://opencode.ai/zen/go/v1".to_string());
-
-    ResolvedOpenCodeConfig {
-        api_key,
-        api_key_source,
-        base_url,
-    }
-}
-
-pub fn opencode_api_key() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    resolve_opencode_config(&env, &paths::config_dir()).api_key
-}
-
-pub fn opencode_api_key_source() -> Option<&'static str> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    resolve_opencode_config(&env, &paths::config_dir()).api_key_source
-}
-
-pub fn opencode_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    resolve_opencode_config(&env, &paths::config_dir()).base_url
-}
-
 pub fn is_verbose() -> bool {
     log_verbose()
 }
@@ -584,54 +305,6 @@ pub fn anthropic_base_url() -> String {
         return raw.clone();
     }
     "https://api.anthropic.com".to_string()
-}
-
-pub fn kimi_oauth_host() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_KIMI_OAUTH_HOST") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(kimi) = file.kimi
-        && let Some(host) = kimi.oauth_host
-    {
-        return host;
-    }
-    "https://auth.kimi.com".to_string()
-}
-
-pub fn kimi_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_KIMI_BASE_URL") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(kimi) = file.kimi
-        && let Some(url) = kimi.base_url
-    {
-        return url;
-    }
-    "https://api.kimi.com/coding/v1".to_string()
-}
-
-pub fn kimi_user_agent(default: &str) -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_KIMI_USER_AGENT") {
-        return raw.clone();
-    }
-    if let Some(raw) = env.get("CCP_USER_AGENT") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(kimi) = file.kimi
-        && let Some(ua) = kimi.user_agent
-    {
-        return ua;
-    }
-    default.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -903,75 +576,6 @@ pub fn codex_transport() -> CodexTransport {
     CodexTransport::WebSocket
 }
 
-// ---------------------------------------------------------------------------
-// Cursor config
-// ---------------------------------------------------------------------------
-
-pub fn cursor_base_url() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CURSOR_BASE_URL") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(cursor) = file.cursor
-        && let Some(url) = cursor.base_url
-    {
-        return url;
-    }
-    "https://api2.cursor.sh".to_string()
-}
-
-pub fn cursor_client_version() -> String {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CURSOR_CLIENT_VERSION") {
-        return raw.clone();
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(cursor) = file.cursor
-        && let Some(version) = cursor.client_version
-    {
-        return version;
-    }
-    detect_cursor_agent_version().unwrap_or_else(|| "cli-2026.07.23-e383d2b".to_string())
-}
-
-fn detect_cursor_agent_version() -> Option<String> {
-    let output = std::process::Command::new("cursor-agent")
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let version = String::from_utf8(output.stdout).ok()?;
-    let version = version.lines().next()?.trim();
-    if version.is_empty() {
-        return None;
-    }
-    Some(if version.starts_with("cli-") {
-        version.to_string()
-    } else {
-        format!("cli-{version}")
-    })
-}
-
-pub fn cursor_agent_bundle() -> Option<String> {
-    let env: HashMap<_, _> = std::env::vars().collect();
-    if let Some(raw) = env.get("CCP_CURSOR_AGENT_BUNDLE") {
-        return Some(raw.clone());
-    }
-    let config_dir = paths::config_dir();
-    if let Some(file) = read_file_config(&config_dir)
-        && let Some(cursor) = file.cursor
-        && let Some(bundle) = cursor.agent_bundle
-    {
-        return Some(bundle);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1002,36 +606,6 @@ mod tests {
             "CCP_CONFIG_DIR".to_string(),
             config.path().to_string_lossy().into_owned(),
         )])
-    }
-
-    #[test]
-    fn opencode_config_reads_file_and_env_precedence() {
-        let config = tempfile::TempDir::new().unwrap();
-        std::fs::write(
-            config.path().join("config.json"),
-            r#"{"opencode":{"apiKey":"file-key","baseUrl":"https://file.example/v1"}}"#,
-        )
-        .unwrap();
-        let mut env = HashMap::new();
-        let resolved = resolve_opencode_config(&env, config.path());
-        assert_eq!(resolved.api_key.as_deref(), Some("file-key"));
-        assert_eq!(resolved.api_key_source, Some("config.json"));
-        assert_eq!(resolved.base_url, "https://file.example/v1");
-
-        env.insert("OPENCODE_API_KEY".into(), "standard-key".into());
-        let resolved = resolve_opencode_config(&env, config.path());
-        assert_eq!(resolved.api_key.as_deref(), Some("standard-key"));
-        assert_eq!(resolved.api_key_source, Some("OPENCODE_API_KEY"));
-
-        env.insert("CCP_OPENCODE_API_KEY".into(), "ccp-key".into());
-        env.insert(
-            "CCP_OPENCODE_BASE_URL".into(),
-            "https://env.example/v1".into(),
-        );
-        let resolved = resolve_opencode_config(&env, config.path());
-        assert_eq!(resolved.api_key.as_deref(), Some("ccp-key"));
-        assert_eq!(resolved.api_key_source, Some("CCP_OPENCODE_API_KEY"));
-        assert_eq!(resolved.base_url, "https://env.example/v1");
     }
 
     #[test]

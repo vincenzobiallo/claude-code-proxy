@@ -18,13 +18,9 @@ const DASHBOARD_HTML: &str = include_str!("dashboard.html");
 
 // Real provider logos, background removed (see the processing script used to
 // generate these - flood-filled from the source marketing assets, not
-// scraped at runtime). No source image exists for "opencode"; it keeps its
-// monogram badge in the frontend instead of a logo here.
+// scraped at runtime).
 const LOGO_ANTHROPIC: &[u8] = include_bytes!("assets/logos/anthropic.png");
 const LOGO_CODEX: &[u8] = include_bytes!("assets/logos/codex.png");
-const LOGO_CURSOR: &[u8] = include_bytes!("assets/logos/cursor.png");
-const LOGO_KIMI: &[u8] = include_bytes!("assets/logos/kimi.png");
-const LOGO_GROK: &[u8] = include_bytes!("assets/logos/grok.png");
 
 #[derive(Clone)]
 pub struct DashboardState {
@@ -52,9 +48,6 @@ async fn dashboard_logo(
     let bytes: &'static [u8] = match provider {
         "anthropic" => LOGO_ANTHROPIC,
         "codex" => LOGO_CODEX,
-        "cursor" => LOGO_CURSOR,
-        "kimi" => LOGO_KIMI,
-        "grok" => LOGO_GROK,
         _ => {
             return json_error(
                 StatusCode::NOT_FOUND,
@@ -178,7 +171,7 @@ async fn dashboard_config(
 /// Claude route with a 401 - see the project README.
 pub fn setup_text(port: u16, registry: &Registry) -> String {
     let grouped = registry.grouped_models();
-    let model_summary = ["codex", "kimi", "cursor"]
+    let model_summary = ["codex"]
         .into_iter()
         .filter_map(|provider| {
             grouped

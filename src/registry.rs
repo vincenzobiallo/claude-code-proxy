@@ -24,19 +24,6 @@ pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "claude-fable-5",
 ];
 
-pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
-
-const CURSOR_LEGACY_MODELS: &[&str] = &[
-    "cursor",
-    "cursor-agent",
-    "cursor-composer",
-    "cursor-composer-fast",
-    "cursor-plan",
-    "cursor-ask",
-    "composer-2.5",
-    "composer-2.5-fast",
-];
-
 pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.2",
     "gpt-5.3-codex",
@@ -49,9 +36,6 @@ pub(crate) const CODEX_MODELS: &[&str] = &[
     "gpt-5.6-terra",
     "gpt-6-astra",
 ];
-
-pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
-pub(crate) const GROK_MODELS: &[&str] = &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6"];
 
 pub struct Registry {
     alias_provider: AliasProvider,
@@ -70,32 +54,12 @@ impl Registry {
                 .collect(),
         );
         models.insert("codex".into(), expand_codex_models());
-        models.insert(
-            "kimi".into(),
-            KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
-        );
-        models.insert("cursor".into(), build_cursor_models());
-        models.insert(
-            "grok".into(),
-            GROK_MODELS
-                .iter()
-                .map(|model| (*model).to_string())
-                .collect(),
-        );
-        models.insert(
-            "opencode".into(),
-            crate::providers::opencode::advertised_models(),
-        );
 
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
                 "anthropic" => Arc::new(crate::providers::anthropic::AnthropicProvider::new()),
                 "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
-                "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
-                "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
-                "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
-                "opencode" => Arc::new(crate::providers::opencode::OpenCodeProvider::new()),
                 _ => Arc::new(PlaceholderProvider::new(name, entries.clone())),
             };
             handlers.insert(name.clone(), handler);
@@ -186,9 +150,6 @@ impl Registry {
         if is_anthropic_alias(&normalized) || normalized.starts_with("claude-") {
             return self.handlers.get(self.alias_provider.as_str()).cloned();
         }
-        if is_cursor_model(&normalized) {
-            return self.handlers.get("cursor").cloned();
-        }
 
         // Exact model-name match reaches a specific backend regardless of the alias
         // target: this is how `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the
@@ -228,31 +189,17 @@ pub fn is_anthropic_alias(model: &str) -> bool {
     ANTHROPIC_STYLE_ALIASES.contains(&model)
 }
 
-pub fn is_cursor_model(model: &str) -> bool {
-    if CURSOR_LEGACY_MODELS.contains(&model) {
-        return true;
-    }
-
-    CURSOR_PREFIXES
-        .iter()
-        .any(|prefix| model.starts_with(prefix))
-}
-
 struct PlaceholderProvider {
     name: &'static str,
     models: Vec<String>,
 }
 
 impl PlaceholderProvider {
-    fn new(name: &str, models: Vec<String>) -> Self {
-        let name = match name {
-            "codex" => "codex",
-            "kimi" => "kimi",
-            "cursor" => "cursor",
-            "grok" => "grok",
-            _ => "codex",
-        };
-        Self { name, models }
+    fn new(_name: &str, models: Vec<String>) -> Self {
+        Self {
+            name: "codex",
+            models,
+        }
     }
 }
 
@@ -267,13 +214,7 @@ impl Provider for PlaceholderProvider {
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {
-        match self.name {
-            "codex" => &CODEX_CLI,
-            "kimi" => &KIMI_CLI,
-            "cursor" => &CURSOR_CLI,
-            "grok" => &GROK_CLI,
-            _ => &CODEX_CLI,
-        }
+        &CODEX_CLI
     }
 
     async fn handle_messages(&self, _body: MessagesRequest, ctx: RequestContext) -> Response {
@@ -328,9 +269,7 @@ impl CliHandlers for PlaceholderCli {
 }
 
 const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
-const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
-const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
-const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
+
 fn expand_codex_models() -> Vec<String> {
     let mut set = HashSet::new();
     let mut out = Vec::new();
@@ -347,15 +286,6 @@ fn expand_codex_models() -> Vec<String> {
     out
 }
 
-fn build_cursor_models() -> Vec<String> {
-    let mut out: Vec<String> = CURSOR_LEGACY_MODELS
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    out.sort_unstable();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,14 +294,6 @@ mod tests {
     fn normalize_model_trims_hint() {
         assert_eq!(normalize_incoming_model("gpt-5.4-fast[1m]"), "gpt-5.4-fast");
         assert_eq!(normalize_incoming_model("gpt-5.4-fast"), "gpt-5.4-fast");
-    }
-
-    #[test]
-    fn alias_routes_to_configured_provider() {
-        let registry = Registry::new(AliasProvider::Kimi);
-        let p = registry.provider_for_model("haiku", None);
-        assert!(p.is_some());
-        assert_eq!(p.expect("provider").name(), "kimi");
     }
 
     #[test]
@@ -426,75 +348,5 @@ mod tests {
         let registry = Registry::new(AliasProvider::Anthropic);
         let p = registry.provider_for_model("claude-opus-4-8", Some(&AliasProvider::Codex));
         assert_eq!(p.expect("provider").name(), "anthropic");
-    }
-
-    #[test]
-    fn cursor_prefix_routes() {
-        let registry = Registry::new(AliasProvider::Codex);
-        assert_eq!(
-            registry
-                .provider_for_model("cursor:gpt-5.5", None)
-                .unwrap()
-                .name(),
-            "cursor"
-        );
-        assert_eq!(
-            registry
-                .provider_for_model("cursor-plan:gpt-5.5", None)
-                .unwrap()
-                .name(),
-            "cursor"
-        );
-        assert_eq!(
-            registry
-                .provider_for_model("cursor-ask:gpt-5.5", None)
-                .unwrap()
-                .name(),
-            "cursor"
-        );
-    }
-
-    #[test]
-    fn opencode_models_route_without_stealing_existing_provider_ids() {
-        let registry = Registry::new(AliasProvider::Codex);
-        assert_eq!(
-            registry
-                .provider_for_model("kimi-k2.7-code", None)
-                .unwrap()
-                .name(),
-            "opencode"
-        );
-        assert_eq!(
-            registry
-                .provider_for_model("opencode-go/kimi-k2.6", None)
-                .unwrap()
-                .name(),
-            "opencode"
-        );
-        assert_eq!(
-            registry
-                .provider_for_model("kimi-k2.6", None)
-                .unwrap()
-                .name(),
-            "kimi"
-        );
-        for (model, owner) in [
-            ("gpt-5.6-luna", "codex"),
-            ("grok-4.5", "grok"),
-            ("grok-4.6", "grok"),
-            ("kimi-k3", "kimi"),
-        ] {
-            assert_eq!(
-                registry.provider_for_model(model, None).unwrap().name(),
-                owner
-            );
-            assert_eq!(
-                registry
-                    .provider_for_model(&format!("opencode-go/{model}"), None)
-                    .unwrap()
-                    .name(),
-                "opencode"
-            );
-        }
     }
 }

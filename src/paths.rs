@@ -80,18 +80,6 @@ pub fn codex_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("codex").join("auth.json")
 }
 
-pub fn kimi_auth_file(deps: &DirResolverEnv) -> PathBuf {
-    resolve_config_dir(deps).join("kimi").join("auth.json")
-}
-
-pub fn cursor_auth_file(deps: &DirResolverEnv) -> PathBuf {
-    resolve_config_dir(deps).join("cursor").join("auth.json")
-}
-
-pub fn kimi_device_id_file(deps: &DirResolverEnv) -> PathBuf {
-    resolve_config_dir(deps).join("kimi").join("device_id")
-}
-
 pub fn log_file() -> PathBuf {
     resolve_state_dir(&DirResolverEnv::default()).join("proxy.log")
 }

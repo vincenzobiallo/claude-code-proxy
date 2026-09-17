@@ -47,21 +47,6 @@ enum Commands {
         #[command(subcommand)]
         command: ProviderGroup,
     },
-    /// Manage Kimi authentication
-    Kimi {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    /// Manage Cursor authentication
-    Cursor {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
-    /// Manage Grok authentication
-    Grok {
-        #[command(subcommand)]
-        command: ProviderGroup,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -117,9 +102,6 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Codex { command } => run_provider_cli("codex", command),
-        Commands::Kimi { command } => run_provider_cli("kimi", command),
-        Commands::Cursor { command } => run_provider_cli("cursor", command),
-        Commands::Grok { command } => run_provider_cli("grok", command),
     }
 }
 
@@ -273,40 +255,14 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
 }
 
 fn print_models(registry: &Registry, full: bool) {
+    let _ = full;
     let grouped = registry.grouped_models();
-    for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
+    for provider in ["codex"] {
         let Some(models) = grouped.get(provider) else {
             continue;
         };
-        if full || provider != "cursor" {
-            println!("{provider}: {}", models.join(", "));
-        } else {
-            println!("{provider}: {}", compact_cursor_list(models));
-        }
+        println!("{provider}: {}", models.join(", "));
     }
-}
-
-fn compact_cursor_list(models: &[String]) -> String {
-    let mut legacy = Vec::new();
-    let mut dynamic = Vec::new();
-    for model in models {
-        if !model.contains(':') {
-            legacy.push(model.clone());
-        } else {
-            dynamic.push(model.clone());
-        }
-    }
-    let mut out = String::new();
-    if !legacy.is_empty() {
-        out.push_str(&legacy.join(", "));
-        out.push_str("; ");
-    }
-    out.push_str(&format!("{} cursor model aliases", dynamic.len()));
-    if !dynamic.is_empty() {
-        out.push_str(", example: cursor:gpt-5.5");
-    }
-    out.push_str(" run `claude-code-proxy models --full` for all aliases");
-    out
 }
 
 fn listen_url(bind_address: &str, port: u16) -> String {

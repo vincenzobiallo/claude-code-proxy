@@ -93,7 +93,6 @@ pub(crate) fn record_session_request_with_affinity_update(
     {
         next.affinity_provider = Some(match provider_name {
             "codex" => AliasProvider::Codex,
-            "kimi" => AliasProvider::Kimi,
             _ => next.affinity_provider.unwrap_or(AliasProvider::Codex),
         });
     }
@@ -115,7 +114,7 @@ pub(crate) fn record_session_request_with_affinity_update(
 }
 
 fn is_alias_routable_provider(name: &str) -> bool {
-    matches!(name, "codex" | "kimi")
+    matches!(name, "codex")
 }
 
 #[cfg(test)]
@@ -172,8 +171,8 @@ mod tests {
         let after_review = record_session_request_with_affinity_update(
             Some(session_id),
             Some(&initial),
-            "kimi",
-            "kimi-for-coding",
+            "anthropic",
+            "opus",
             false,
             2,
         )

@@ -141,99 +141,6 @@ impl Provider for FakeProvider {
     }
 }
 
-struct TranslatingProvider {
-    name: &'static str,
-    model: &'static str,
-    captured: Arc<Mutex<Option<Value>>>,
-}
-
-#[async_trait]
-impl Provider for TranslatingProvider {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn supported_models(&self) -> Vec<String> {
-        vec![self.model.to_string()]
-    }
-
-    fn cli(&self) -> &'static dyn CliHandlers {
-        &FAKE_CLI
-    }
-
-    async fn handle_messages(
-        &self,
-        _body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> axum::response::Response {
-        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
-    }
-
-    async fn handle_count_tokens(
-        &self,
-        _body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> axum::response::Response {
-        (StatusCode::NOT_IMPLEMENTED, "unused").into_response()
-    }
-
-    async fn generate_anthropic_stream(
-        &self,
-        body: MessagesRequest,
-        _ctx: RequestContext,
-    ) -> Result<Generation, ProviderError> {
-        let translated = match self.name {
-            "kimi" => serde_json::to_value(
-                claude_code_proxy::providers::kimi::translate::request::translate_request(
-                    &body,
-                    claude_code_proxy::providers::kimi::translate::request::TranslateOptions {
-                        session_id: None,
-                    },
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-            "grok" => serde_json::to_value(
-                claude_code_proxy::providers::grok::translate::request::translate_request(
-                    &body,
-                    self.model.to_string(),
-                )
-                .unwrap(),
-            )
-            .unwrap(),
-            _ => unreachable!(),
-        };
-        *self.captured.lock().unwrap() = Some(translated);
-        let sse = concat!(
-            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fake\",\"model\":\"test\",\"usage\":{\"input_tokens\":1}}}\n\n",
-            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
-            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
-            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
-            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
-            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
-        );
-        Ok(Generation {
-            body: GenerationBody::BufferedSse(sse.into()),
-            resolved_model: self.model.to_string(),
-        })
-    }
-}
-
-fn translating_registry(
-    name: &'static str,
-    model: &'static str,
-    captured: Arc<Mutex<Option<Value>>>,
-) -> Arc<Registry> {
-    Arc::new(Registry::from_providers(
-        AliasProvider::Kimi,
-        vec![Arc::new(TranslatingProvider {
-            name,
-            model,
-            captured,
-        }) as Arc<dyn Provider>],
-    ))
-}
-
 type CapturedIdentity = (Option<ConversationIdentity>, Option<String>);
 
 struct IdentityCaptureProvider {
@@ -284,21 +191,27 @@ impl Provider for IdentityCaptureProvider {
     }
 }
 
+// The alias target must not be literally named "codex": server.rs special-cases
+// that exact provider name to bypass openai_compat for the real native Codex
+// path, which these fakes are not exercising. It also can't be reached by an
+// exact model match: Registry::provider_for_model skips "anthropic" in that
+// loop by design, so the fake registered there is only reachable via an
+// Anthropic-style alias (e.g. "sonnet"), matching how the real provider works.
 fn routed_registry() -> Arc<Registry> {
     Arc::new(Registry::from_providers(
-        AliasProvider::Kimi,
+        AliasProvider::Anthropic,
         vec![
             Arc::new(FakeProvider {
-                name: "kimi",
-                models: vec!["kimi-k2.6".to_string()],
+                name: "anthropic",
+                models: vec![],
             }) as Arc<dyn Provider>,
             Arc::new(FakeProvider {
-                name: "grok",
-                models: vec!["grok-4.5".to_string()],
+                name: "stub-a",
+                models: vec!["stub-a-model".to_string()],
             }),
             Arc::new(FakeProvider {
-                name: "cursor",
-                models: vec!["cursor".to_string()],
+                name: "stub-b",
+                models: vec!["stub-b-model".to_string()],
             }),
         ],
     ))
@@ -622,7 +535,7 @@ async fn rejected_request_carries_a_request_id() {
 // return path than a success.
 #[tokio::test]
 async fn provider_failure_response_carries_a_request_id() {
-    let response = messages_response(app(routed_registry()), "kimi-k2.6").await;
+    let response = messages_response(app(routed_registry()), "stub-a-model").await;
 
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     assert!(!request_id(&response).is_empty());
@@ -1206,23 +1119,18 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
     for (uri, request, expected) in [
         (
             "/v1/chat/completions",
-            json!({"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}]}),
-            "kimi",
+            json!({"model":"stub-a-model","messages":[{"role":"user","content":"hello"}]}),
+            "stub-a",
         ),
         (
             "/v1/responses",
-            json!({"model":"grok-4.5","input":"hello"}),
-            "grok",
-        ),
-        (
-            "/v1/chat/completions",
-            json!({"model":"cursor:gpt-5.5","messages":[{"role":"user","content":"hello"}]}),
-            "cursor",
+            json!({"model":"stub-b-model","input":"hello"}),
+            "stub-b",
         ),
         (
             "/v1/responses",
             json!({"model":"sonnet","input":"hello"}),
-            "kimi",
+            "anthropic",
         ),
     ] {
         let response = app_with_options(routed_registry(), None, true)
@@ -1253,59 +1161,6 @@ async fn openai_routes_select_non_codex_providers_and_aliases() {
 }
 
 #[tokio::test]
-async fn openai_routes_preserve_serial_tool_calls_upstream() {
-    for (provider, model, uri, body, expected_choice) in [
-        (
-            "kimi",
-            "kimi-k2.6",
-            "/v1/chat/completions",
-            json!({
-                "model":"kimi-k2.6",
-                "messages":[{"role":"user","content":"look up x"}],
-                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
-                "tool_choice":{"type":"function","function":{"name":"lookup"}},
-                "parallel_tool_calls":false
-            }),
-            json!({"type":"function","function":{"name":"lookup"}}),
-        ),
-        (
-            "grok",
-            "grok-4.5",
-            "/v1/responses",
-            json!({
-                "model":"grok-4.5",
-                "input":"look up x",
-                "tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
-                "tool_choice":"none",
-                "parallel_tool_calls":false
-            }),
-            json!("none"),
-        ),
-    ] {
-        let captured = Arc::new(Mutex::new(None));
-        let response = app_with_options(
-            translating_registry(provider, model, captured.clone()),
-            None,
-            true,
-        )
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(uri)
-                .header("content-type", "application/json")
-                .body(body_string(&body.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let translated = captured.lock().unwrap().clone().unwrap();
-        assert_eq!(translated["parallel_tool_calls"], false);
-        assert_eq!(translated["tool_choice"], expected_choice);
-    }
-}
-
-#[tokio::test]
 async fn routed_openai_streams_use_surface_specific_events() {
     let chat = app_with_options(routed_registry(), None, true)
         .oneshot(
@@ -1314,7 +1169,7 @@ async fn routed_openai_streams_use_surface_specific_events() {
                 .uri("/v1/chat/completions")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"model":"kimi-k2.6","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}"#,
+                    r#"{"model":"stub-a-model","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"hello"}]}"#,
                 ))
                 .unwrap(),
         )
@@ -1338,7 +1193,7 @@ async fn routed_openai_streams_use_surface_specific_events() {
                 .uri("/v1/responses")
                 .header("content-type", "application/json")
                 .body(body_string(
-                    r#"{"model":"grok-4.5","stream":true,"input":"hello"}"#,
+                    r#"{"model":"stub-a-model","stream":true,"input":"hello"}"#,
                 ))
                 .unwrap(),
         )
@@ -1367,7 +1222,7 @@ async fn non_codex_validation_uses_openai_errors_before_generation() {
                 .header("content-type", "application/json")
                 .header("x-client-request-id", "invalid-routed-request")
                 .body(body_string(
-                    r#"{"model":"kimi-k2.6","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#,
+                    r#"{"model":"stub-a-model","messages":[{"role":"user","content":"hello"}],"temperature":0.5}"#,
                 ))
                 .unwrap(),
         )
@@ -1574,7 +1429,7 @@ async fn models_endpoint_lists_supported_models() {
     assert!(!data.is_empty());
     let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
     assert!(ids.contains(&"gpt-5.6-sol"));
-    assert!(ids.contains(&"grok-4.6"));
+    assert!(ids.contains(&"gpt-6-astra"));
     for entry in data {
         assert_eq!(entry["type"], "model");
         assert!(entry["display_name"].as_str().is_some());

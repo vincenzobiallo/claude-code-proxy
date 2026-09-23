@@ -8,18 +8,61 @@
 //! api.anthropic.com and stream the response straight back. The proxy holds zero
 //! Anthropic credentials and never touches the cache-keyed request prefix.
 
+pub mod model_catalog;
+
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::Response;
+use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::anthropic::error::json_error;
 use crate::anthropic::schema::MessagesRequest;
 use crate::logging::create_logger;
+use crate::monitor::{MonitorHandle, usage_from_anthropic_sse};
 use crate::provider::{CliHandlers, Provider, RequestContext};
 use crate::providers::translate_shared::wrap_reasoning;
 use crate::registry::ANTHROPIC_STYLE_ALIASES;
+
+/// Anthropic reports the Claude subscription's rolling usage windows on every
+/// response via `anthropic-ratelimit-unified-<window>-*` headers (undocumented
+/// on the public API reference, but what Claude Code's own status line reads
+/// to show "5h"/"weekly" usage). `utilization` is a 0.0-1.0 fraction; `reset`
+/// is a unix-epoch-seconds string.
+const UNIFIED_RATE_LIMIT_WINDOWS: [(&str, &str); 2] = [("5h", "five_hour"), ("7d", "seven_day")];
+
+fn record_unified_rate_limits(monitor: &MonitorHandle, headers: &reqwest::header::HeaderMap) {
+    for (suffix, window) in UNIFIED_RATE_LIMIT_WINDOWS {
+        let Some(utilization) =
+            header_f64(headers, &format!("anthropic-ratelimit-unified-{suffix}-utilization"))
+        else {
+            continue;
+        };
+        let resets_at =
+            header_epoch_seconds(headers, &format!("anthropic-ratelimit-unified-{suffix}-reset"));
+        monitor.usage_window_updated(
+            "anthropic",
+            window,
+            (utilization * 100.0).clamp(0.0, 100.0),
+            resets_at,
+        );
+    }
+}
+
+fn header_f64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
+fn header_epoch_seconds(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    let raw = headers.get(name)?.to_str().ok()?.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp().max(0) as u64)
+}
 
 /// Rewrite an outgoing Anthropic request body so it survives a mid-conversation switch
 /// away from the codex backend.
@@ -201,6 +244,7 @@ impl AnthropicProvider {
             );
         };
 
+        model_catalog::global().remember_auth(&passthrough.headers);
         let url = format!("{}{}", self.base_url, passthrough.path_and_query);
         let mut headers = axum::http::HeaderMap::with_capacity(passthrough.headers.len());
         for (name, value) in passthrough.headers.iter() {
@@ -232,6 +276,9 @@ impl AnthropicProvider {
         match upstream {
             Ok(upstream) => {
                 let status = upstream.status();
+                if let Some(monitor) = monitor.as_ref() {
+                    record_unified_rate_limits(monitor, upstream.headers());
+                }
                 let mut out_headers =
                     axum::http::HeaderMap::with_capacity(upstream.headers().len());
                 for (name, value) in upstream.headers() {
@@ -240,7 +287,37 @@ impl AnthropicProvider {
                     }
                     out_headers.append(name.clone(), value.clone());
                 }
-                let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+
+                // Tee the byte stream: bytes reach the client completely
+                // unmodified (the cache-keyed prefix must stay byte-identical),
+                // while each chunk is also scanned for the `usage` fields
+                // Anthropic's SSE frames carry, so the monitor/TUI can show
+                // real input/output token counts for native Anthropic traffic
+                // (previously only the Codex-translated path reported these).
+                let monitor_for_stream = monitor.clone();
+                let req_id_for_stream = req_id.clone();
+                let mut generation_started = false;
+                let byte_stream = upstream.bytes_stream().map(move |chunk| {
+                    if let Ok(chunk) = &chunk
+                        && let Some(monitor) = monitor_for_stream.as_ref()
+                    {
+                        if !generation_started && !chunk.is_empty() {
+                            monitor.generation_started(&req_id_for_stream);
+                            generation_started = true;
+                        }
+                        let (input_tokens, output_tokens) = usage_from_anthropic_sse(chunk);
+                        monitor.stream_progress(
+                            &req_id_for_stream,
+                            chunk.len() as u64,
+                            1,
+                            input_tokens,
+                            output_tokens,
+                        );
+                    }
+                    chunk
+                });
+
+                let mut response = Response::new(Body::from_stream(byte_stream));
                 *response.status_mut() = status;
                 *response.headers_mut() = out_headers;
                 response

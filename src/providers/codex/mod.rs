@@ -6,11 +6,13 @@ pub mod continuation;
 pub mod count_tokens;
 pub(crate) mod events;
 pub mod images;
+pub mod model_catalog;
 pub mod native;
 pub mod request_summary;
 pub mod search;
 pub mod transcription;
 pub mod translate;
+pub mod usage;
 pub mod websocket;
 
 use async_trait::async_trait;
@@ -527,13 +529,13 @@ impl Provider for CodexProvider {
     }
 
     fn supported_models(&self) -> Vec<String> {
+        // `-fast` aliases are accepted on input but never listed - see
+        // `model_allowlist::fast_alias_base`.
         let mut models: Vec<String> = registry::CODEX_MODELS
             .iter()
             .map(|m| m.to_string())
             .collect();
-        for m in registry::CODEX_MODELS {
-            models.push(format!("{m}-fast"));
-        }
+        models.extend(model_catalog::global().snapshot_ids());
         models.sort_unstable();
         models.dedup();
         models
@@ -2087,11 +2089,11 @@ mod tests {
     }
 
     #[test]
-    fn supported_models_includes_fast_variants() {
+    fn supported_models_never_lists_fast_variants() {
         let provider = CodexProvider::new();
         let models = provider.supported_models();
         assert!(models.contains(&"gpt-5.6-sol".to_string()));
-        assert!(models.contains(&"gpt-5.6-sol-fast".to_string()));
+        assert!(!models.iter().any(|model| model.ends_with("-fast")));
         assert!(models.contains(&"gpt-5.6-terra".to_string()));
         assert!(models.contains(&"gpt-5.6-luna".to_string()));
         assert!(models.contains(&"gpt-5.4".to_string()));

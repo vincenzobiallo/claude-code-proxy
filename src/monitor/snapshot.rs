@@ -2,7 +2,7 @@
 //! stay in the monitor store; viewers receive elapsed durations and computed rates.
 use super::{
     ActiveRequest, CompletedRequest, EndpointKind, MonitorState, QuotaStatus, RequestStatus,
-    SessionSummary, Throughput,
+    SessionSummary, Throughput, UsageWindow,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -78,6 +78,8 @@ pub struct MonitorSnapshot {
     pub recent: Vec<CompletedSnapshot>,
     #[serde(default)]
     pub quota: Vec<QuotaStatus>,
+    #[serde(default)]
+    pub usage_windows: Vec<UsageWindow>,
 }
 
 impl From<MonitorState> for MonitorSnapshot {
@@ -90,6 +92,7 @@ impl From<MonitorState> for MonitorSnapshot {
             active: state.active.into_iter().map(Into::into).collect(),
             recent: state.recent.into_iter().map(Into::into).collect(),
             quota: state.quota,
+            usage_windows: state.usage_windows,
         }
     }
 }

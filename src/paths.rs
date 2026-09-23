@@ -64,7 +64,16 @@ pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
     join_with_sep(&base, &["claude-code-proxy"], false)
 }
 
+/// The pre-`resolve_config_dir` location, still read (and cleared on logout)
+/// as a fallback. An explicit `CCP_CONFIG_DIR` override disables that
+/// fallback by pointing it back at the override itself: otherwise a process
+/// isolated to its own config dir (every test does this) would still read -
+/// and, on logout or a 401 token refresh, delete - the real user's
+/// `~/.config/claude-code-proxy/<provider>/auth.json`.
 pub fn legacy_config_dir(deps: &DirResolverEnv) -> PathBuf {
+    if deps.env.contains_key("CCP_CONFIG_DIR") {
+        return resolve_config_dir(deps);
+    }
     join_with_sep(&deps.home, &[".config", "claude-code-proxy"], false)
 }
 
@@ -82,6 +91,32 @@ pub fn codex_auth_file(deps: &DirResolverEnv) -> PathBuf {
 
 pub fn log_file() -> PathBuf {
     resolve_state_dir(&DirResolverEnv::default()).join("proxy.log")
+}
+
+/// Disk cache of the last live-fetched Codex model catalog, so a restart
+/// doesn't lose what was discovered while offline. Regenerable, so it lives
+/// under `state_dir()` alongside `log_file()`, not `config_dir()`.
+pub fn codex_model_catalog_cache_file() -> PathBuf {
+    resolve_state_dir(&DirResolverEnv::default()).join("codex_model_catalog.json")
+}
+
+/// Disk cache of the last live-fetched Anthropic model catalog. See
+/// `codex_model_catalog_cache_file` for why this lives under `state_dir()`.
+pub fn anthropic_model_catalog_cache_file() -> PathBuf {
+    resolve_state_dir(&DirResolverEnv::default()).join("anthropic_model_catalog.json")
+}
+
+/// Writes `contents` to a sibling temp file, then renames it over `path`, so
+/// a crash mid-write never leaves a truncated file behind (which the cache
+/// loaders would otherwise silently discard).
+pub fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, contents)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 pub fn provider_auth_file(provider: &str) -> PathBuf {
@@ -143,4 +178,32 @@ pub fn resolve_state_dir_for_env(
         env: env.clone(),
         home: home.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deps(env: &[(&str, &str)]) -> DirResolverEnv {
+        DirResolverEnv {
+            platform: "linux".to_string(),
+            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            home: "/home/user".to_string(),
+        }
+    }
+
+    #[test]
+    fn legacy_dir_is_under_home_without_an_override() {
+        assert_eq!(
+            legacy_config_dir(&deps(&[])),
+            PathBuf::from("/home/user/.config/claude-code-proxy")
+        );
+    }
+
+    #[test]
+    fn config_dir_override_also_isolates_the_legacy_dir() {
+        let deps = deps(&[("CCP_CONFIG_DIR", "/tmp/isolated")]);
+        assert_eq!(legacy_config_dir(&deps), PathBuf::from("/tmp/isolated"));
+        assert_eq!(legacy_config_dir(&deps), resolve_config_dir(&deps));
+    }
 }

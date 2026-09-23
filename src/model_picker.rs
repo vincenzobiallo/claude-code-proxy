@@ -16,6 +16,13 @@ pub struct PickerEntry {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PickerSelection {
     pub entries: Vec<PickerEntry>,
+    /// Mirrors `modelPicker.replaceBuiltInOptions` in `~/.claude/settings.json`:
+    /// `false` (the default) keeps Claude Code's native Opus/Sonnet/Haiku/Fable
+    /// dropdown entries alongside `entries`; `true` replaces them so only
+    /// `entries` shows in `/model`. Only takes effect in `settings.json` once
+    /// applied with the TUI's "o" override, same as `entries` itself.
+    #[serde(default)]
+    pub replace_built_in_options: bool,
 }
 
 impl PickerSelection {
@@ -34,13 +41,48 @@ impl PickerSelection {
         Ok(())
     }
 
+    /// Matches by the normalized (1m-suffix-stripped) model id, ignoring
+    /// `provider` - entries don't record it (see `registry::ordered_models`,
+    /// which re-derives it from the model list), and an entry customized
+    /// through `set_alias` may or may not carry the `[1m]` suffix regardless
+    /// of `picker_model_field`'s per-provider default.
     pub fn position(&self, provider: &str, model: &str) -> Option<usize> {
-        let field = picker_model_field(provider, model);
-        self.entries.iter().position(|entry| entry.model.eq_ignore_ascii_case(&field))
+        let _ = provider;
+        let base = crate::registry::normalize_incoming_model(model);
+        self.entries
+            .iter()
+            .position(|entry| crate::registry::normalize_incoming_model(&entry.model).eq_ignore_ascii_case(&base))
     }
 
     pub fn is_enabled(&self, provider: &str, model: &str) -> bool {
         self.position(provider, model).is_some()
+    }
+
+    pub fn entry_at(&self, provider: &str, model: &str) -> Option<&PickerEntry> {
+        self.position(provider, model).map(|index| &self.entries[index])
+    }
+
+    /// The alias/description the Models view should show for `provider/model`:
+    /// its live picker entry when enabled (`live: true`), else
+    /// `curated_default` as a dimmed suggestion (`live: false`), else blank.
+    pub fn preview(&self, provider: &str, model: &str) -> (String, String, bool) {
+        if let Some(entry) = self.entry_at(provider, model) {
+            return (entry.label.clone(), entry.description.clone(), true);
+        }
+        match curated_default(provider, model) {
+            Some((label, description)) => (label.to_string(), description.to_string(), false),
+            None => (String::new(), String::new(), false),
+        }
+    }
+
+    /// Whether `provider/model` currently requests the 1M-context variant:
+    /// the stored entry's own field when enabled, otherwise the same
+    /// per-provider default `toggle` uses for a brand new entry.
+    pub fn use_1m(&self, provider: &str, model: &str) -> bool {
+        match self.entry_at(provider, model) {
+            Some(entry) => entry.model.to_ascii_lowercase().ends_with("[1m]"),
+            None => provider == "codex",
+        }
     }
 
     /// Toggles `provider/model`. Re-enabling a model reuses the label/description
@@ -57,12 +99,32 @@ impl PickerSelection {
             .iter()
             .find(|entry| entry.model.eq_ignore_ascii_case(&field))
             .cloned()
-            .unwrap_or_else(|| PickerEntry {
-                model: field,
-                label: model.to_string(),
-                description: format!("via {provider}"),
+            .unwrap_or_else(|| {
+                let (label, description) = match curated_default(provider, model) {
+                    Some((label, description)) => (label.to_string(), description.to_string()),
+                    None => (model.to_string(), format!("via {provider}")),
+                };
+                PickerEntry { model: field, label, description }
             });
         self.entries.push(entry);
+    }
+
+    /// Sets (or creates) `provider/model`'s alias (`label`) and whether it
+    /// requests the 1M-context variant, driven by the TUI's "a" editor
+    /// (`tui::render_alias_editor`). An existing entry keeps its position and
+    /// description; a brand new one gets `curated_default`'s description
+    /// when there is one, else the same placeholder `toggle` uses.
+    pub fn set_alias(&mut self, provider: &str, model: &str, label: String, use_1m: bool) {
+        let field = model_field(model, use_1m);
+        if let Some(index) = self.position(provider, model) {
+            self.entries[index].model = field;
+            self.entries[index].label = label;
+        } else {
+            let description = curated_default(provider, model)
+                .map(|(_, description)| description.to_string())
+                .unwrap_or_else(|| format!("via {provider}"));
+            self.entries.push(PickerEntry { model: field, label, description });
+        }
     }
 
     /// Swaps the entry at `index` with its neighbor `delta` steps away
@@ -91,10 +153,37 @@ impl PickerSelection {
 /// `registry::normalize_incoming_model`, which strips it back off before
 /// routing). The picker always requests that variant for codex models.
 fn picker_model_field(provider: &str, model: &str) -> String {
-    if provider == "codex" && !model.to_ascii_lowercase().ends_with("[1m]") {
-        format!("{model}[1m]")
-    } else {
-        model.to_string()
+    model_field(model, provider == "codex")
+}
+
+/// Builds the `modelPicker.options[].model` value for `model`, with or
+/// without the `[1m]` suffix that requests its 1M-token context variant
+/// (see `registry::normalize_incoming_model`, which strips it back off
+/// before routing).
+fn model_field(model: &str, use_1m: bool) -> String {
+    let base = crate::registry::normalize_incoming_model(model);
+    if use_1m { format!("{base}[1m]") } else { base }
+}
+
+/// Anthropic's own official label/description for its model-family aliases
+/// (matches Claude Code's own `/model` picker UI) - used to pre-fill a fresh
+/// picker entry instead of a generic placeholder. No equivalent catalog
+/// exists for Codex models or for pinned Anthropic snapshots (e.g.
+/// `claude-sonnet-5`), which fall back to `format!("via {provider}")`
+/// until the user sets one with the TUI's "a" alias editor.
+fn curated_default(provider: &str, model: &str) -> Option<(&'static str, &'static str)> {
+    if provider != "anthropic" {
+        return None;
+    }
+    match model {
+        "sonnet" => Some(("Sonnet", "Sonnet 5 \u{b7} Efficient for routine tasks")),
+        "fable" => Some((
+            "Fable",
+            "Fable 5.1 \u{b7} Most capable for your hardest and longest-running tasks \u{b7} Requires usage credits",
+        )),
+        "opus" => Some(("Opus", "Opus 5 \u{b7} Best for everyday, complex tasks \u{b7} ~2\u{d7} usage vs Sonnet")),
+        "haiku" => Some(("Haiku", "Haiku 4.5 \u{b7} Fastest for quick answers")),
+        _ => None,
     }
 }
 
@@ -121,11 +210,17 @@ pub fn read_existing_entries(path: &Path) -> Vec<PickerEntry> {
         .unwrap_or_default()
 }
 
-/// Overwrites `modelPicker.options` in `~/.claude/settings.json` with
-/// `entries`, preserving every other key in the file (including
-/// `modelPicker.replaceBuiltInOptions`, if set) and leaving a `.bak` copy of
-/// the previous contents next to it before writing.
-pub fn apply_override(path: &Path, entries: &[PickerEntry]) -> anyhow::Result<()> {
+/// Overwrites `modelPicker.options` and `modelPicker.replaceBuiltInOptions`
+/// in `~/.claude/settings.json`, preserving every other key in the file and
+/// leaving a `.bak` copy of the previous contents next to it before writing.
+/// Unlike `options`, `replaceBuiltInOptions` is always written explicitly
+/// (even `false`) so the TUI's toggle state is never left stale behind a
+/// value some earlier, unrelated edit of `settings.json` happened to leave.
+pub fn apply_override(
+    path: &Path,
+    entries: &[PickerEntry],
+    replace_built_in_options: bool,
+) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|_| "{}".to_string());
     let mut root: serde_json::Value = serde_json::from_str(&text)
         .map_err(|err| anyhow::anyhow!("{} is not valid JSON: {err}", path.display()))?;
@@ -143,10 +238,12 @@ pub fn apply_override(path: &Path, entries: &[PickerEntry]) -> anyhow::Result<()
     if !picker.is_object() {
         *picker = serde_json::json!({});
     }
-    picker
-        .as_object_mut()
-        .expect("just ensured it's an object")
-        .insert("options".to_string(), serde_json::to_value(entries)?);
+    let picker = picker.as_object_mut().expect("just ensured it's an object");
+    picker.insert("options".to_string(), serde_json::to_value(entries)?);
+    picker.insert(
+        "replaceBuiltInOptions".to_string(),
+        serde_json::json!(replace_built_in_options),
+    );
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -166,6 +263,45 @@ mod tests {
         assert_eq!(selection.entries[0].model, "gpt-5.6-terra[1m]");
         selection.toggle("codex", "gpt-5.6-terra", &[]);
         assert!(selection.entries.is_empty());
+    }
+
+    #[test]
+    fn toggle_prefills_curated_label_and_description_for_a_known_alias() {
+        let mut selection = PickerSelection::default();
+        selection.toggle("anthropic", "sonnet", &[]);
+        assert_eq!(selection.entries[0].label, "Sonnet");
+        assert!(selection.entries[0].description.starts_with("Sonnet 5"));
+    }
+
+    #[test]
+    fn set_alias_creates_an_entry_with_the_chosen_label_and_1m_flag() {
+        let mut selection = PickerSelection::default();
+        selection.set_alias("codex", "gpt-5.6-terra", "Terra".to_string(), false);
+        assert_eq!(selection.entries.len(), 1);
+        assert_eq!(selection.entries[0].model, "gpt-5.6-terra");
+        assert_eq!(selection.entries[0].label, "Terra");
+        assert!(selection.is_enabled("codex", "gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn set_alias_updates_an_existing_entry_in_place_and_keeps_its_description() {
+        let mut selection = PickerSelection::default();
+        selection.toggle("codex", "gpt-5.6-terra", &[]);
+        let original_description = selection.entries[0].description.clone();
+        selection.set_alias("codex", "gpt-5.6-terra", "Terra".to_string(), false);
+        assert_eq!(selection.entries.len(), 1);
+        assert_eq!(selection.entries[0].model, "gpt-5.6-terra");
+        assert_eq!(selection.entries[0].label, "Terra");
+        assert_eq!(selection.entries[0].description, original_description);
+    }
+
+    #[test]
+    fn position_matches_regardless_of_a_customized_1m_suffix() {
+        let mut selection = PickerSelection::default();
+        // A model whose provider default is 1m-on, customized to 1m-off.
+        selection.set_alias("codex", "gpt-5.6-terra", "Terra".to_string(), false);
+        assert!(selection.is_enabled("codex", "gpt-5.6-terra"));
+        assert!(!selection.use_1m("codex", "gpt-5.6-terra"));
     }
 
     #[test]
@@ -202,11 +338,29 @@ mod tests {
             label: "gpt-5.6-terra".to_string(),
             description: "d".to_string(),
         }];
-        apply_override(&path, &entries).unwrap();
+        apply_override(&path, &entries, true).unwrap();
         assert!(path.with_extension("json.bak").exists());
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["someOtherSetting"], true);
         assert_eq!(written["modelPicker"]["options"][0]["model"], "gpt-5.6-terra[1m]");
+        assert_eq!(written["modelPicker"]["replaceBuiltInOptions"], true);
+    }
+
+    #[test]
+    fn apply_override_always_writes_replace_built_in_options_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"modelPicker": {"replaceBuiltInOptions": true, "options": []}}"#,
+        )
+        .unwrap();
+        // A later apply with `false` must actually flip it, not just leave
+        // the earlier `true` in place because the key was already present.
+        apply_override(&path, &[], false).unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written["modelPicker"]["replaceBuiltInOptions"], false);
     }
 }

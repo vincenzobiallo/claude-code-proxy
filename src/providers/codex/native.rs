@@ -19,8 +19,8 @@ use crate::traffic::{
 
 use super::client::{CodexError, CodexHttpClient};
 use super::translate::model_allowlist::{
-    ALLOWED_MODELS, MODEL_ALIASES, assert_allowed_model, full_lane_web_search_model,
-    uses_responses_lite,
+    MODEL_ALIASES, assert_allowed_model, fast_alias_base, full_lane_web_search_model,
+    known_models, uses_responses_lite,
 };
 
 pub struct CodexNativeBackend {
@@ -102,7 +102,7 @@ pub fn validate_native_request_model(body: &Value) -> Result<String, Response> {
             format!(
                 "Model '{requested}' resolves to unsupported model '{}'. Supported: {}",
                 error.model,
-                ALLOWED_MODELS.join(", ")
+                known_models().join(", ")
             ),
             Some("model"),
             Some("model_not_supported"),
@@ -140,9 +140,9 @@ fn shape_native_request(body: &mut Value) -> Result<NativeResolved, Response> {
 }
 
 fn resolve_native_model(requested: &str) -> (String, bool) {
-    let (requested, priority) = match requested.strip_suffix("-fast") {
-        Some(base) if ALLOWED_MODELS.contains(&base) => (base, true),
-        _ => (requested, false),
+    let (requested, priority) = match fast_alias_base(requested) {
+        Some(base) => (base, true),
+        None => (requested, false),
     };
     let model = MODEL_ALIASES
         .iter()
@@ -688,6 +688,24 @@ mod tests {
         assert!(shape_native_request(&mut json!([])).is_err());
         assert!(shape_native_request(&mut json!({})).is_err());
         assert!(shape_native_request(&mut json!({"model": 7})).is_err());
+    }
+
+    #[test]
+    fn native_fast_alias_works_for_a_live_discovered_model() {
+        crate::providers::codex::model_catalog::global().merge(vec![
+            crate::providers::codex::model_catalog::FetchedCodexModel {
+                id: "gpt-native-test-discovered".to_string(),
+                use_responses_lite: None,
+            },
+        ]);
+        assert_eq!(
+            resolve_native_model("gpt-native-test-discovered-fast"),
+            ("gpt-native-test-discovered".to_string(), true)
+        );
+        assert_eq!(
+            resolve_native_model("gpt-unknown-fast"),
+            ("gpt-unknown-fast".to_string(), false)
+        );
     }
 
     #[test]

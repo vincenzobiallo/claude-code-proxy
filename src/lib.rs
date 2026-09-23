@@ -1,7 +1,9 @@
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod console_branding;
 pub mod dashboard;
+pub mod headroom;
 pub mod instance_lock;
 pub mod logging;
 pub mod model_picker;

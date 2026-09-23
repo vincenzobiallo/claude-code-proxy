@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use axum::{http::StatusCode, response::Response};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
@@ -113,6 +113,26 @@ impl Registry {
                 }
             }
         }
+        // Live-discovered models, unioned on top of the static baseline (see
+        // `providers::codex::model_catalog` / `providers::anthropic::model_catalog`
+        // module docs) - additive only, so a bad/empty live fetch never hides
+        // a model this proxy already knew about.
+        // `-fast` aliases are routable but never listed (see
+        // `model_allowlist::fast_alias_base`).
+        if provider == "codex" {
+            for id in crate::providers::codex::model_catalog::global().snapshot_ids() {
+                if !models.iter().any(|value| value == &id) {
+                    models.push(id);
+                }
+            }
+        }
+        if provider == "anthropic" {
+            for id in crate::providers::anthropic::model_catalog::global().snapshot_ids() {
+                if !models.iter().any(|value| value == &id) {
+                    models.push(id);
+                }
+            }
+        }
         models.sort_unstable();
         models
     }
@@ -154,16 +174,33 @@ impl Registry {
         // Exact model-name match reaches a specific backend regardless of the alias
         // target: this is how `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the
         // sonnet slot to codex even while aliases default to the Anthropic passthrough.
-        for (name, models) in &self.models {
-            if name == "anthropic" {
-                continue;
-            }
-            if models.iter().any(|candidate| candidate == &normalized) {
+        for name in self.handlers.keys() {
+            if name != "anthropic" && self.provider_knows_model(name, &normalized) {
                 return self.handlers.get(name).cloned();
             }
         }
 
         None
+    }
+
+    /// Exact-match routing check, without building/sorting the full listing
+    /// per request: the static baseline, plus the live Codex catalog and its
+    /// unlisted `-fast` aliases, so a live-discovered model is routable, not
+    /// just listed.
+    fn provider_knows_model(&self, provider: &str, model: &str) -> bool {
+        let in_baseline = self
+            .models
+            .get(provider)
+            .is_some_and(|models| models.iter().any(|candidate| candidate == model));
+        if in_baseline {
+            return true;
+        }
+        if provider == "codex" {
+            use crate::providers::codex::translate::model_allowlist;
+            return model_allowlist::is_known_model(model)
+                || model_allowlist::fast_alias_base(model).is_some();
+        }
+        false
     }
 
     pub fn unknown_model_message(&self) -> String {
@@ -271,24 +308,30 @@ impl CliHandlers for PlaceholderCli {
 const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 
 fn expand_codex_models() -> Vec<String> {
-    let mut set = HashSet::new();
-    let mut out = Vec::new();
-    for model in CODEX_MODELS {
-        if set.insert((*model).to_string()) {
-            out.push((*model).to_string());
-        }
-        let fast = format!("{model}-fast");
-        if set.insert(fast.clone()) {
-            out.push(fast);
-        }
-    }
+    let mut out: Vec<String> = CODEX_MODELS.iter().map(|model| (*model).to_string()).collect();
     out.sort_unstable();
+    out.dedup();
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listings_never_include_fast_aliases() {
+        let registry = Registry::new(AliasProvider::Anthropic);
+        for (model, _) in registry.all_supported_models() {
+            assert!(!model.ends_with("-fast"), "{model} should not be listed");
+        }
+    }
+
+    #[test]
+    fn unlisted_fast_alias_still_routes_to_codex() {
+        let registry = Registry::new(AliasProvider::Anthropic);
+        let provider = registry.provider_for_model("gpt-5.4-fast", None).unwrap();
+        assert_eq!(provider.name(), "codex");
+    }
 
     #[test]
     fn normalize_model_trims_hint() {

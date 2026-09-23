@@ -167,6 +167,9 @@ pub async fn serve_listener(
             ),
         ])),
     );
+    if let Some(monitor) = monitor.clone() {
+        tokio::spawn(crate::providers::codex::usage::run_poller(monitor));
+    }
     let app = app_with_monitor(Arc::new(Registry::with_default_alias()), monitor);
     axum::serve(
         listener,
@@ -357,20 +360,31 @@ struct ModelsQuery {
 /// Claude Code only adds entries whose id starts with `claude` or `anthropic`,
 /// so the Anthropic-style aliases are what surface in its `/model` picker;
 /// raw provider ids are still listed for other Anthropic-compatible clients.
+///
+/// Never fetches upstream itself (refreshing is on demand, from the monitor);
+/// it only remembers the caller's auth headers in memory so that refresh can
+/// authenticate - see `providers::anthropic::model_catalog`.
 async fn handler_models(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ModelsQuery>,
+    headers: http::HeaderMap,
 ) -> Json<serde_json::Value> {
+    crate::providers::anthropic::model_catalog::global().remember_auth(&headers);
+    let anthropic_catalog = crate::providers::anthropic::model_catalog::global();
     let mut data: Vec<Value> = state
         .registry
         .all_supported_models()
         .into_iter()
         .map(|(model, provider)| {
+            let display_name = anthropic_catalog
+                .display_name_for(&model)
+                .unwrap_or_else(|| format!("{model} ({provider})"));
             json!({
                 "type": "model",
                 "object": "model",
                 "id": model,
-                "display_name": format!("{model} ({provider})"),
+                "display_name": display_name,
+                "created_at": anthropic_catalog.created_at_for(&model),
             })
         })
         .collect();

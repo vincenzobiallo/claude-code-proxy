@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     ActiveRequest, CompletedRequest, EndpointKind, MonitorState, QuotaStatus, RequestStatus,
-    SessionUsage, session_summaries,
+    SessionUsage, UsageWindow, session_summaries,
 };
 
 const TICK_MILLIS: u64 = 250;
@@ -380,6 +380,35 @@ fn mock_state_for_tick(
         message: Some("Codex 5-hour usage window exhausted".to_string()),
         updated_at: now,
     }];
+    let usage_windows = vec![
+        UsageWindow {
+            provider: "anthropic".to_string(),
+            window: "five_hour".to_string(),
+            used_percentage: 42.0,
+            resets_at: (now + Duration::from_secs(2 * 3_600))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs()),
+            updated_at: now,
+        },
+        UsageWindow {
+            provider: "anthropic".to_string(),
+            window: "seven_day".to_string(),
+            used_percentage: 71.0,
+            resets_at: (now + Duration::from_secs(3 * 24 * 3_600))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs()),
+            updated_at: now,
+        },
+        UsageWindow {
+            provider: "codex".to_string(),
+            window: "monthly".to_string(),
+            used_percentage: 14.0,
+            resets_at: None,
+            updated_at: now,
+        },
+    ];
     MonitorState {
         started_at,
         uptime: now.duration_since(started_at).unwrap_or_default(),
@@ -387,6 +416,7 @@ fn mock_state_for_tick(
         active,
         recent: recent.into_iter().collect(),
         quota,
+        usage_windows,
     }
 }
 

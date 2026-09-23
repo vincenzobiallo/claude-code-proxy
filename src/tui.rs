@@ -27,8 +27,9 @@ use ratatui::{
 use tokio::sync::oneshot;
 
 use crate::{
+    headroom::{HeadroomHandle, HeadroomStatus},
     model_picker::{self, PickerSelection},
-    monitor::{ActiveRequest, MonitorHandle, MonitorState, SessionSummary},
+    monitor::{ActiveRequest, MonitorHandle, MonitorState, SessionSummary, UsageWindow},
     paths,
     registry::Registry,
 };
@@ -74,6 +75,19 @@ fn provider_dot(name: &str) -> Span<'static> {
     Span::styled("\u{25cf} ", Style::default().fg(provider_color(name)))
 }
 
+const SPINNER_FRAMES: [char; 10] = ['\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280f}'];
+
+/// A wall-clock-driven animation frame, not a stored counter - the TUI
+/// redraws on its own poll cadence (see `run_events`), so sampling the clock
+/// each render is simpler than threading extra state through `MonitorApp`.
+fn spinner_frame() -> char {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    SPINNER_FRAMES[((millis / 100) % SPINNER_FRAMES.len() as u128) as usize]
+}
+
 /// The registry key is the internal id ("anthropic", "codex"); the product
 /// people actually recognize is "Claude" (Anthropic) and "Codex" (OpenAI).
 /// Only used for display - lookups still go through the raw registry key.
@@ -116,6 +130,11 @@ fn header_row(cells: &[&str]) -> Row<'static> {
 pub struct MonitorUiConfig<'a> {
     pub listen_url: String,
     pub registry: &'a Registry,
+    pub headroom: Option<HeadroomHandle>,
+    /// The proxy's own runtime: the "r" model refresh runs there, so the
+    /// shared HTTP clients' pooled connections always belong to a runtime
+    /// that outlives them.
+    pub runtime: tokio::runtime::Handle,
     pub shutdown: Option<oneshot::Sender<()>>,
     pub shutdown_complete: Option<mpsc::Receiver<()>>,
 }
@@ -135,6 +154,7 @@ pub fn run_monitor(
     let mut app = MonitorApp {
         listen_url: config.listen_url,
         registry: config.registry,
+        headroom: config.headroom,
         phase: MonitorPhase::Running,
         view: View::Activity,
         show_help: false,
@@ -147,6 +167,8 @@ pub fn run_monitor(
         confirm_override: false,
         picker_error: None,
         picker_status: None,
+        alias_editor: None,
+        model_refresh: ModelRefresh::new(config.runtime),
         shutdown: config.shutdown,
         shutdown_complete: config.shutdown_complete,
     };
@@ -170,6 +192,7 @@ fn run_events(
     app: &mut MonitorApp<'_>,
 ) -> Result<MonitorExit, anyhow::Error> {
     loop {
+        app.model_refresh.poll();
         let state = handle.snapshot();
         app.clamp_selection(&state);
         terminal.draw(|frame| render(frame, app, &state))?;
@@ -192,7 +215,9 @@ fn run_events(
                 }
                 _ if app.phase == MonitorPhase::ShuttingDown => {}
                 KeyCode::Esc => {
-                    if app.confirm_override {
+                    if app.alias_editor.is_some() {
+                        app.alias_editor = None;
+                    } else if app.confirm_override {
                         app.confirm_override = false;
                     } else if app.show_picker_json {
                         app.show_picker_json = false;
@@ -203,6 +228,7 @@ fn run_events(
                         app.phase = MonitorPhase::Running;
                     }
                 }
+                _ if app.alias_editor.is_some() => app.handle_alias_editor_key(key.code),
                 KeyCode::Char('y') if app.confirm_override => {
                     app.apply_picker_override();
                     app.confirm_override = false;
@@ -230,6 +256,15 @@ fn run_events(
                 }
                 KeyCode::Char(' ') if app.view == View::Models && !app.show_picker_json => {
                     app.toggle_selected_model();
+                }
+                KeyCode::Char('a') if app.view == View::Models && !app.show_picker_json => {
+                    app.open_alias_editor();
+                }
+                KeyCode::Char('r') if app.view == View::Models && !app.show_picker_json => {
+                    app.model_refresh.start();
+                }
+                KeyCode::Char('b') if app.view == View::Models && !app.show_picker_json => {
+                    app.toggle_replace_built_in_options();
                 }
                 KeyCode::Char('[') if app.view == View::Models && !app.show_picker_json => {
                     app.move_selected_model(-1);
@@ -301,6 +336,7 @@ impl View {
 struct MonitorApp<'a> {
     listen_url: String,
     registry: &'a Registry,
+    headroom: Option<HeadroomHandle>,
     phase: MonitorPhase,
     view: View,
     show_help: bool,
@@ -313,17 +349,96 @@ struct MonitorApp<'a> {
     confirm_override: bool,
     picker_error: Option<String>,
     picker_status: Option<String>,
+    alias_editor: Option<AliasEditorState>,
+    model_refresh: ModelRefresh,
     shutdown: Option<oneshot::Sender<()>>,
     shutdown_complete: Option<mpsc::Receiver<()>>,
 }
 
-impl<'a> MonitorApp<'a> {
-    fn handle_ctrl_c(&mut self) -> bool {
-        if self.phase == MonitorPhase::ShuttingDown {
-            true
+/// The Models view's "r" refresh of every provider's live model catalog.
+/// Spawned on the proxy's runtime so the UI loop never waits on the network;
+/// `poll` picks the summary up once it's done.
+struct ModelRefresh {
+    runtime: tokio::runtime::Handle,
+    pending: Option<mpsc::Receiver<String>>,
+    last: Option<String>,
+}
+
+impl ModelRefresh {
+    fn new(runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            runtime,
+            pending: None,
+            last: None,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.runtime.spawn(async move {
+            let _ = tx.send(crate::providers::refresh_model_catalogs().await);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn poll(&mut self) {
+        let Some(rx) = &self.pending else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(summary) => {
+                self.last = Some(summary);
+                self.pending = None;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.last = Some("refresh failed (worker exited)".to_string());
+                self.pending = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    fn status(&self) -> Option<String> {
+        if self.pending.is_some() {
+            Some(format!("{} refreshing models...", spinner_frame()))
         } else {
-            self.begin_shutdown();
-            false
+            self.last.clone()
+        }
+    }
+}
+
+/// State for the "a" alias editor popup (Models view): the alias/label and
+/// whether to request the 1M-context (`[1m]`) variant for the model under
+/// the cursor when it was opened.
+struct AliasEditorState {
+    provider: String,
+    model: String,
+    label: String,
+    use_1m: bool,
+}
+
+impl<'a> MonitorApp<'a> {
+    /// Ctrl+C never shuts down on a single, unconfirmed press - a stray key
+    /// combo (or a copy that lands wrong in a Windows console) would otherwise
+    /// kill live sessions with no warning. First press asks for confirmation,
+    /// same prompt as `q`; a second press while that prompt (or an
+    /// already-running graceful shutdown) is up confirms/forces it, so
+    /// "ctrl+c ctrl+c" is still the fast path when a graceful shutdown hangs
+    /// on a stuck request.
+    fn handle_ctrl_c(&mut self) -> bool {
+        match self.phase {
+            MonitorPhase::ShuttingDown => true,
+            MonitorPhase::ConfirmingShutdown => {
+                self.begin_shutdown();
+                false
+            }
+            MonitorPhase::Running => {
+                self.phase = MonitorPhase::ConfirmingShutdown;
+                false
+            }
         }
     }
 
@@ -390,6 +505,54 @@ impl<'a> MonitorApp<'a> {
         let _ = self.picker.save(&paths::model_picker_file());
     }
 
+    /// Opens the "a" alias editor for the model under the cursor, pre-filled
+    /// with its current alias (or the curated suggestion, or the bare model
+    /// id) and its current 1M-context choice.
+    fn open_alias_editor(&mut self) {
+        let ordered = ordered_models(self.registry, &self.picker);
+        let Some((provider, model)) = ordered.get(self.model_offset).cloned() else {
+            return;
+        };
+        let (preview_label, _description, _live) = self.picker.preview(&provider, &model);
+        let label = if preview_label.is_empty() { model.clone() } else { preview_label };
+        let use_1m = self.picker.use_1m(&provider, &model);
+        self.alias_editor = Some(AliasEditorState { provider, model, label, use_1m });
+    }
+
+    /// Routes a keypress to the open alias editor. `Esc` (cancel, handled
+    /// alongside the app's other popups in `run_events`) is the only key not
+    /// funneled through here.
+    fn handle_alias_editor_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Enter => {
+                let Some(editor) = self.alias_editor.take() else { return };
+                let label = if editor.label.trim().is_empty() {
+                    editor.model.clone()
+                } else {
+                    editor.label.trim().to_string()
+                };
+                self.picker.set_alias(&editor.provider, &editor.model, label, editor.use_1m);
+                let _ = self.picker.save(&paths::model_picker_file());
+            }
+            KeyCode::Tab => {
+                if let Some(editor) = self.alias_editor.as_mut() {
+                    editor.use_1m = !editor.use_1m;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(editor) = self.alias_editor.as_mut() {
+                    editor.label.pop();
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(editor) = self.alias_editor.as_mut() {
+                    editor.label.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Reordering only makes sense while the cursor sits on an already-enabled
     /// row - `ordered_models` always places those first, in `picker.entries`
     /// order, so that's exactly the rows with index `< picker.entries.len()`.
@@ -404,17 +567,30 @@ impl<'a> MonitorApp<'a> {
     }
 
     fn apply_picker_override(&mut self) {
-        match model_picker::apply_override(&paths::claude_settings_file(), &self.picker.entries) {
+        match model_picker::apply_override(
+            &paths::claude_settings_file(),
+            &self.picker.entries,
+            self.picker.replace_built_in_options,
+        ) {
             Ok(()) => {
                 self.picker_status = Some(format!(
-                    "Wrote {} entries to {}",
+                    "Wrote {} entries to {} (replaceBuiltInOptions: {})",
                     self.picker.entries.len(),
-                    paths::claude_settings_file().display()
+                    paths::claude_settings_file().display(),
+                    self.picker.replace_built_in_options
                 ));
                 self.picker_error = None;
             }
             Err(err) => self.picker_error = Some(err.to_string()),
         }
+    }
+
+    /// Toggles whether an override (`o`) replaces Claude Code's native
+    /// Opus/Sonnet/Haiku/Fable `/model` entries or just adds `entries`
+    /// alongside them (`modelPicker.replaceBuiltInOptions`).
+    fn toggle_replace_built_in_options(&mut self) {
+        self.picker.replace_built_in_options = !self.picker.replace_built_in_options;
+        let _ = self.picker.save(&paths::model_picker_file());
     }
 }
 
@@ -572,14 +748,49 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut MonitorApp<'_>, state: &Moni
             &app.picker,
             app.model_offset,
             &mut app.model_scroll,
+            app.model_refresh.status(),
         ),
     }
     render_footer(frame, root[3], &*app);
-    if app.show_picker_json {
+    if let Some(editor) = &app.alias_editor {
+        render_alias_editor(frame, area, editor);
+    } else if app.show_picker_json {
         render_picker_json(frame, area, &*app);
     } else if app.show_help {
         render_help(frame, area);
     }
+}
+
+fn render_alias_editor(frame: &mut ratatui::Frame<'_>, area: Rect, editor: &AliasEditorState) {
+    let popup = centered_rect(60, 30, area);
+    frame.render_widget(Clear, popup);
+
+    let checkbox = if editor.use_1m { "[x]" } else { "[ ]" };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Alias: ", Style::default().fg(HEADING)),
+            Span::styled(editor.label.clone(), Style::default().fg(TEXT)),
+            Span::styled("\u{2588}", Style::default().fg(ACCENT)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(format!("{checkbox} "), Style::default().fg(if editor.use_1m { OK } else { DIM })),
+            Span::styled("Use 1M context variant ([1m])", Style::default().fg(TEXT)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "enter: save   tab: toggle 1m   esc: cancel",
+            Style::default().fg(DIM),
+        )),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(TEXT)).block(panel(
+            format!(" Set alias - {}/{} ", editor.provider, editor.model),
+            true,
+        )),
+        popup,
+    );
 }
 
 fn render_banner(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp<'_>) {
@@ -604,6 +815,15 @@ fn render_banner(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp<'_
     providers_line.push(Span::raw("  "));
     providers_line.extend(provider_status("codex", "Codex"));
 
+    // Headroom is a sidecar proxy in front of this one, not an inference
+    // provider, so it doesn't belong in the "Providers:" list above - its
+    // status dot (and, once ready, its dashboard link) live in the footer
+    // instead (see `render_footer` / `headroom_status_spans`).
+    let tail_spans = vec![Span::styled(
+        "  \u{259d}\u{259d} \u{259d}\u{259d}",
+        Style::default().fg(ACCENT),
+    )];
+
     let lines = vec![
         Line::from(vec![
             Span::styled(" \u{2590}\u{259b}\u{2588}\u{2588}\u{2588}\u{259b}\u{2588}   ", Style::default().fg(ACCENT)),
@@ -618,10 +838,7 @@ fn render_banner(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp<'_
                 .chain(providers_line)
                 .collect::<Vec<_>>(),
         ),
-        Line::from(Span::styled(
-            "  \u{259d}\u{259d} \u{259d}\u{259d}",
-            Style::default().fg(ACCENT),
-        )),
+        Line::from(tail_spans),
     ];
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -639,7 +856,10 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
         Line::from("up/down, j/k   scroll or select in the current view"),
         Line::from("l              (Providers) log in to the selected provider"),
         Line::from("space          (Models) toggle the selected model in/out of modelPicker.options"),
+        Line::from("a              (Models) set the selected model's alias + 1M-context variant"),
         Line::from("[ ]            (Models) reorder an enabled model within the list"),
+        Line::from("r              (Models) refresh the live model lists of every provider"),
+        Line::from("b              (Models) toggle replaceBuiltInOptions (hide the native /model list)"),
         Line::from("p              (Models) preview modelPicker.options JSON"),
         Line::from("e              (JSON preview) edit the JSON in $VISUAL/$EDITOR"),
         Line::from("o              (JSON preview) overwrite ~/.claude/settings.json (confirm y/n)"),
@@ -652,8 +872,9 @@ fn render_help(frame: &mut ratatui::Frame<'_>, area: Rect) {
             "CLI commands",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         )),
-        Line::from("serve [--port N] [--no-monitor]   start the proxy"),
-        Line::from("models [--full]                   list supported models"),
+        Line::from("serve [--port N] [--no-monitor] [--no-headroom]   start the proxy"),
+        Line::from("code [args...]                     open a claude session against it"),
+        Line::from("models [--full]                    list supported models"),
         Line::from("codex auth login|device|status|logout"),
         Line::from("version | --version | -v"),
     ];
@@ -702,10 +923,7 @@ fn render_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp<'_
         Span::styled(state.active.len().to_string(), base.add_modifier(Modifier::BOLD)),
         Span::styled("   ", base),
     ];
-    for (i, view) in View::ALL.into_iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled("\u{2502}", base.fg(ACCENT_FG)));
-        }
+    for view in View::ALL {
         let style = if view == app.view {
             Style::default().fg(ACCENT).bg(BG).add_modifier(Modifier::BOLD)
         } else {
@@ -723,14 +941,14 @@ fn render_activity(frame: &mut ratatui::Frame<'_>, area: Rect, state: &MonitorSt
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(35),
-            Constraint::Length(4),
+            Constraint::Percentage(40),
+            Constraint::Percentage(28),
+            Constraint::Length(8),
         ])
         .split(area);
     render_sessions(frame, rows[0], &state.sessions, session_offset);
     render_active(frame, rows[1], &state.active);
-    render_consumption(frame, rows[2], &state.sessions);
+    render_consumption(frame, rows[2], &state.sessions, &state.usage_windows);
 }
 
 fn render_sessions(frame: &mut ratatui::Frame<'_>, area: Rect, sessions: &[SessionSummary], offset: usize) {
@@ -808,7 +1026,54 @@ fn render_active(frame: &mut ratatui::Frame<'_>, area: Rect, active: &[ActiveReq
     frame.render_widget(table, area);
 }
 
-fn render_consumption(frame: &mut ratatui::Frame<'_>, area: Rect, sessions: &[SessionSummary]) {
+/// Width, in filled/empty block chars, of a usage bar - matches the Claude
+/// Code status line's own `makeBar` (`~/.claude/statusbar/lib/format.js`).
+const USAGE_BAR_WIDTH: usize = 12;
+
+fn usage_bar_color(pct: f64) -> Color {
+    if pct > 80.0 {
+        BAD
+    } else if pct > 65.0 {
+        WARN
+    } else {
+        OK
+    }
+}
+
+/// One "label [bar] NN%  resets in Xh" line, mirroring the status line's own
+/// 5-hour usage bar so the TUI and `claude`'s own prompt read the same way.
+fn usage_bar_line(label: &str, window: &UsageWindow) -> Line<'static> {
+    let pct = window.used_percentage.clamp(0.0, 999.0);
+    let filled = ((pct / 100.0) * USAGE_BAR_WIDTH as f64)
+        .round()
+        .clamp(0.0, USAGE_BAR_WIDTH as f64) as usize;
+    let bar = "\u{2593}".repeat(filled) + &"\u{2591}".repeat(USAGE_BAR_WIDTH - filled);
+    let color = usage_bar_color(pct);
+    let mut spans = vec![
+        Span::styled(format!("{label:<15}"), Style::default().fg(HEADING)),
+        Span::styled(bar, Style::default().fg(color)),
+        Span::styled(
+            format!(" {pct:>3.0}%"),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(resets_at) = window.resets_at {
+        let target = std::time::UNIX_EPOCH + Duration::from_secs(resets_at);
+        let text = match target.duration_since(std::time::SystemTime::now()) {
+            Ok(remaining) => format!("  resets in {}", format_duration(remaining)),
+            Err(_) => "  reset pending".to_string(),
+        };
+        spans.push(Span::styled(text, Style::default().fg(DIM)));
+    }
+    Line::from(spans)
+}
+
+fn render_consumption(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    sessions: &[SessionSummary],
+    usage_windows: &[UsageWindow],
+) {
     let mut total_in = 0u64;
     let mut total_out = 0u64;
     let mut by_provider: BTreeMap<String, (u64, u64)> = BTreeMap::new();
@@ -847,6 +1112,21 @@ fn render_consumption(frame: &mut ratatui::Frame<'_>, area: Rect, sessions: &[Se
             .collect::<Vec<_>>()
             .join("   |   ");
         lines.push(Line::from(Span::styled(breakdown, Style::default().fg(HEADING))));
+    }
+
+    let find_window = |provider: &str, window: &str| {
+        usage_windows
+            .iter()
+            .find(|entry| entry.provider == provider && entry.window == window)
+    };
+    if let Some(window) = find_window("anthropic", "five_hour") {
+        lines.push(usage_bar_line("claude 5h", window));
+    }
+    if let Some(window) = find_window("anthropic", "seven_day") {
+        lines.push(usage_bar_line("claude weekly", window));
+    }
+    if let Some(window) = find_window("codex", "monthly") {
+        lines.push(usage_bar_line("codex monthly", window));
     }
 
     frame.render_widget(
@@ -944,13 +1224,14 @@ fn render_models(
     picker: &PickerSelection,
     offset: usize,
     scroll: &mut usize,
+    refresh_status: Option<String>,
 ) {
     let ordered = ordered_models(registry, picker);
     // Header row (1) + top/bottom borders (2) don't hold list rows.
     let visible = area.height.saturating_sub(3) as usize;
     clamp_scroll(scroll, offset.min(ordered.len().saturating_sub(1)), visible, ordered.len());
 
-    let header = header_row(&["", "PROVIDER", "MODEL"]);
+    let header = header_row(&["", "PROVIDER", "MODEL", "ALIAS", "DESCRIPTION"]);
     let rows = ordered.iter().enumerate().skip(*scroll).map(|(index, (provider, model))| {
         let enabled = picker.is_enabled(provider, model);
         let mark = if enabled { "[v]" } else { "[ ]" };
@@ -959,20 +1240,54 @@ fn render_models(
         } else {
             Style::default().fg(TEXT)
         };
+        let model_text = if picker.use_1m(provider, model) {
+            format!("{model} [1m]")
+        } else {
+            model.clone()
+        };
+        let (alias, description, live) = picker.preview(provider, model);
+        // A curated default nobody has actually enabled yet is a dimmed
+        // suggestion, not a saved value - `preview`'s `live` flag tells them
+        // apart so the two don't read the same as an applied setting.
+        let alias_color = if live { TEXT } else { DIM };
+        let description_color = if live { HEADING } else { DIM };
         Row::new(vec![
             Cell::from(Span::styled(mark, Style::default().fg(if enabled { OK } else { DIM }))),
             Cell::from(Span::styled(provider_label(provider), Style::default().fg(TEXT))),
-            Cell::from(Span::styled(model.as_str(), Style::default().fg(HEADING))),
+            Cell::from(Span::styled(model_text, Style::default().fg(HEADING))),
+            Cell::from(Span::styled(alias, Style::default().fg(alias_color))),
+            Cell::from(Span::styled(description, Style::default().fg(description_color))),
         ])
         .style(row_style)
     });
 
-    let table = Table::new(rows, [Constraint::Length(4), Constraint::Length(14), Constraint::Min(20)])
-        .header(header)
-        .block(panel(
-            format!(" Models ({}, {} enabled) ", ordered.len(), picker.entries.len()),
-            true,
-        ));
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(4),
+            Constraint::Length(9),
+            Constraint::Length(24),
+            Constraint::Length(14),
+            Constraint::Min(24),
+        ],
+    )
+    .header(header)
+    .block(panel(
+        format!(
+            " Models ({}, {} enabled{}){} ",
+            ordered.len(),
+            picker.entries.len(),
+            if picker.replace_built_in_options {
+                ", replacing native /model options"
+            } else {
+                ""
+            },
+            refresh_status
+                .map(|status| format!(" \u{b7} {status}"))
+                .unwrap_or_default()
+        ),
+        true,
+    ));
     frame.render_widget(table, area);
 }
 
@@ -981,6 +1296,15 @@ fn render_picker_json(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorA
     frame.render_widget(Clear, popup);
 
     let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("replaceBuiltInOptions: ", Style::default().fg(HEADING)),
+        Span::styled(
+            app.picker.replace_built_in_options.to_string(),
+            Style::default().fg(if app.picker.replace_built_in_options { WARN } else { DIM }),
+        ),
+        Span::styled("  (b, from the Models list, to toggle)", Style::default().fg(DIM)),
+    ]));
+    lines.push(Line::from(""));
     if let Some(status) = &app.picker_status {
         lines.push(Line::from(Span::styled(status.clone(), Style::default().fg(OK))));
         lines.push(Line::from(""));
@@ -1018,6 +1342,37 @@ fn render_picker_json(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorA
     );
 }
 
+/// The headroom status dot, "Headroom" label, and - once ready - its
+/// dashboard link, all together in one place (the footer). No headroom
+/// handle means nothing is shown at all.
+fn headroom_status_spans(headroom: Option<&HeadroomHandle>) -> Vec<Span<'static>> {
+    let Some(headroom) = headroom else {
+        return Vec::new();
+    };
+    // Cached by headroom's own watcher thread - never a blocking connect here.
+    let status = headroom.status();
+    let mut spans = vec![Span::raw("  ")];
+    match status {
+        HeadroomStatus::Ready => spans.push(Span::styled("\u{25cf} ", Style::default().fg(OK))),
+        // Still warming up (headroom's own startup - importing its ML deps -
+        // takes several seconds): a spinner instead of a flat red dot makes
+        // clear this is "starting", not "down".
+        HeadroomStatus::Starting => spans.push(Span::styled(
+            format!("{} ", spinner_frame()),
+            Style::default().fg(WARN),
+        )),
+        HeadroomStatus::Down => spans.push(Span::styled("\u{25cf} ", Style::default().fg(BAD))),
+    }
+    spans.push(Span::styled("Headroom", Style::default().fg(TEXT)));
+    if status == HeadroomStatus::Ready {
+        spans.push(Span::styled(
+            format!("  {} ", headroom.dashboard_url()),
+            Style::default().fg(DIM),
+        ));
+    }
+    spans
+}
+
 fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp<'_>) {
     let text = match app.phase {
         MonitorPhase::ConfirmingShutdown => Line::from(Span::styled(
@@ -1049,12 +1404,18 @@ fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &MonitorApp<'_
             if app.view == View::Models {
                 spans.push(key("space"));
                 spans.push(desc(" toggle  "));
+                spans.push(key("a"));
+                spans.push(desc(" alias  "));
                 spans.push(key("[ ]"));
                 spans.push(desc(" reorder  "));
+                spans.push(key("r"));
+                spans.push(desc(" refresh  "));
+                spans.push(key("b"));
+                spans.push(desc(" replace built-ins  "));
                 spans.push(key("p"));
                 spans.push(desc(" json  "));
             }
-            spans.push(desc(&format!("dashboard: {}/dashboard ", app.listen_url)));
+            spans.extend(headroom_status_spans(app.headroom.as_ref()));
             Line::from(spans)
         }
     };

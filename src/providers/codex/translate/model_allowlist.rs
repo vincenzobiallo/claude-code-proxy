@@ -1,6 +1,5 @@
-use std::collections::HashSet;
-
 use crate::config;
+use crate::providers::codex::model_catalog;
 
 use super::request::ServiceTier;
 
@@ -38,23 +37,38 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+/// The single source of truth for "is this a real Codex model id": the
+/// static allowlist plus anything the live catalog has discovered.
+pub fn is_known_model(model: &str) -> bool {
+    ALLOWED_MODELS.contains(&model) || model_catalog::global().contains(model)
+}
+
+/// Every known Codex model id (the catalog is seeded with `ALLOWED_MODELS`),
+/// for "Supported: ..." error messages.
+pub fn known_models() -> Vec<String> {
+    let mut models = model_catalog::global().snapshot_ids();
+    models.sort_unstable();
+    models
+}
+
+/// `<model>-fast` requests `<model>` on the priority service tier. The
+/// `-fast` ids are deliberately never listed anywhere, but are still
+/// accepted on input so existing configs keep working. Returns the base
+/// model when `model` is such an alias of a known model.
+pub fn fast_alias_base(model: &str) -> Option<&str> {
+    model.strip_suffix("-fast").filter(|base| is_known_model(base))
 }
 
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        let base = model.trim_end_matches("-fast");
-        ResolvedModel {
+    match fast_alias_base(model) {
+        Some(base) => ResolvedModel {
             model: base.to_string(),
             service_tier: Some(ServiceTier::Priority),
-        }
-    } else {
-        ResolvedModel {
+        },
+        None => ResolvedModel {
             model: model.to_string(),
             service_tier: None,
-        }
+        },
     }
 }
 
@@ -108,7 +122,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.contains(&model) {
+    if is_known_model(model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -117,11 +131,10 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+/// Delegates to the live-discovered catalog, whose seed data reproduces the
+/// exact set this used to hardcode - see `model_catalog::RESPONSES_LITE_SEED`.
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-5.6-luna" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-6-astra"
-    )
+    model_catalog::global().uses_responses_lite(model)
 }
 
 /// `gpt-5.6-luna` exists only behind the Responses Lite lane; the full
@@ -137,14 +150,9 @@ pub fn full_lane_web_search_model(model: &str) -> &str {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
-        return true;
-    }
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        return true;
-    }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    is_known_model(model)
+        || fast_alias_base(model).is_some()
+        || MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
 }
 
 #[cfg(test)]

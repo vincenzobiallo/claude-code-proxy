@@ -81,6 +81,21 @@ pub struct QuotaStatus {
     pub updated_at: SystemTime,
 }
 
+/// A continuously-reported usage window (as opposed to `QuotaStatus`, which
+/// only fires once a window is actually exhausted). `window` is a stable slug
+/// such as `"five_hour"`, `"seven_day"`, or `"monthly"` - dashboards look one
+/// up by `(provider, window)` rather than assuming a fixed set.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageWindow {
+    pub provider: String,
+    pub window: String,
+    /// 0.0-100.0.
+    pub used_percentage: f64,
+    /// Absolute unix-epoch seconds when the window resets, when known.
+    pub resets_at: Option<u64>,
+    pub updated_at: SystemTime,
+}
+
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
     ProviderQuotaStatus {
@@ -89,6 +104,12 @@ pub enum MonitorEvent {
         resets_at: Option<u64>,
         window: Option<String>,
         message: Option<String>,
+    },
+    UsageWindowUpdated {
+        provider: String,
+        window: String,
+        used_percentage: f64,
+        resets_at: Option<u64>,
     },
     RequestStarted {
         request_id: String,
@@ -269,6 +290,7 @@ pub struct MonitorState {
     pub active: Vec<ActiveRequest>,
     pub recent: Vec<CompletedRequest>,
     pub quota: Vec<QuotaStatus>,
+    pub usage_windows: Vec<UsageWindow>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,6 +340,7 @@ struct MonitorStore {
     session_output_buckets: HashMap<Option<String>, Vec<(u64, u64)>>,
     recent_limit: usize,
     quota: HashMap<String, QuotaStatus>,
+    usage_windows: HashMap<(String, String), UsageWindow>,
 }
 
 #[derive(Debug)]
@@ -361,6 +384,7 @@ impl MonitorHandle {
                 session_output_buckets: HashMap::new(),
                 recent_limit,
                 quota: HashMap::new(),
+                usage_windows: HashMap::new(),
             })),
         }
     }
@@ -381,8 +405,27 @@ impl MonitorHandle {
                 active: Vec::new(),
                 recent: Vec::new(),
                 quota: Vec::new(),
+                usage_windows: Vec::new(),
             },
         }
+    }
+
+    /// Record a provider's continuously-reported usage window (e.g. "42% of
+    /// the 5-hour window used"), as opposed to `provider_quota_status` below,
+    /// which only fires once a window is fully exhausted.
+    pub fn usage_window_updated(
+        &self,
+        provider: impl Into<String>,
+        window: impl Into<String>,
+        used_percentage: f64,
+        resets_at: Option<u64>,
+    ) {
+        self.publish(MonitorEvent::UsageWindowUpdated {
+            provider: provider.into(),
+            window: window.into(),
+            used_percentage,
+            resets_at,
+        });
     }
 
     /// Record a provider's usage-window state. `limited: false` is a manual
@@ -566,6 +609,23 @@ impl MonitorStore {
                         resets_at,
                         window,
                         message,
+                        updated_at: SystemTime::now(),
+                    },
+                );
+            }
+            MonitorEvent::UsageWindowUpdated {
+                provider,
+                window,
+                used_percentage,
+                resets_at,
+            } => {
+                self.usage_windows.insert(
+                    (provider.clone(), window.clone()),
+                    UsageWindow {
+                        provider,
+                        window,
+                        used_percentage,
+                        resets_at,
                         updated_at: SystemTime::now(),
                     },
                 );
@@ -1009,6 +1069,9 @@ impl MonitorStore {
             .collect();
         quota.sort_by(|a, b| a.provider.cmp(&b.provider));
 
+        let mut usage_windows: Vec<UsageWindow> = self.usage_windows.values().cloned().collect();
+        usage_windows.sort_by(|a, b| (&a.provider, &a.window).cmp(&(&b.provider, &b.window)));
+
         MonitorState {
             started_at: self.started_at,
             uptime: self.started_instant.elapsed(),
@@ -1016,6 +1079,7 @@ impl MonitorStore {
             active,
             recent: self.recent.iter().cloned().collect(),
             quota,
+            usage_windows,
         }
     }
 }

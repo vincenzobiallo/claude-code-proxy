@@ -961,6 +961,11 @@ async fn smoke_healthz_returns_ok() {
 #[allow(clippy::await_holding_lock)]
 async fn smoke_codex_model_routes_to_real_provider() {
     let _guard = env_lock();
+    // An empty, isolated config dir: without it this would authenticate with
+    // the developer's real Codex login and send a live request upstream (and
+    // a failed token refresh there clears that login).
+    let config = TempDir::new().unwrap();
+    let _config_env = EnvGuard::set("CCP_CONFIG_DIR", config.path());
     let response = call_messages("gpt-5.5").await;
     // Should attempt auth (not return 501 placeholder)
     assert!(

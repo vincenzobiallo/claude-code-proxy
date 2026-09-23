@@ -23,6 +23,19 @@ fn body_string(json: &str) -> Body {
     Body::from(json.to_string())
 }
 
+/// Points this test binary at an empty config dir for the rest of its run,
+/// so no test can authenticate with - send live requests on behalf of, or
+/// clear on a failed token refresh - the developer's real provider logins.
+/// Set once and never restored: these tests run in parallel with no env
+/// lock, and an empty config is the right default for all of them.
+fn isolate_config_dir() {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| tempfile::TempDir::new().unwrap());
+    unsafe {
+        std::env::set_var("CCP_CONFIG_DIR", dir.path());
+    }
+}
+
 struct EnvGuard {
     key: &'static str,
     previous: Option<std::ffi::OsString>,
@@ -671,6 +684,7 @@ async fn anthropic_bodies_over_limit_return_request_too_large() {
 
 #[tokio::test]
 async fn known_model_reaches_codex_provider() {
+    isolate_config_dir();
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(

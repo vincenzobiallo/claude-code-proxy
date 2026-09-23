@@ -4265,13 +4265,16 @@ mod tests {
             }
         });
 
+        // Generous margins: Windows timers fire on a ~15.6ms tick, so each
+        // keepalive wait takes ~30ms there, not the nominal interval. 300ms
+        // still fits several pings on every platform.
         let error = match collect_ws_events_with_keepalive_interval(
             &mut client,
-            50,
+            300,
             None,
             None,
             None,
-            Duration::from_millis(10),
+            Duration::from_millis(20),
         )
         .await
         {
